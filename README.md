@@ -287,6 +287,17 @@ Editing `lib/client.js` on disk is not enough on its own: the running Host serve
 the old bytes, and a package that declared no `dsh.client` at startup stays
 negative until it restarts.
 
+`/rwm updateplugin` reinstalls through the plugin manager, which removes the
+dependency and then adds it back. A boot that composes the profile inside that
+window sees no package, writes a `cordis.yml` with no row for it, and caches a
+negative client scan — the plugin can come back with its tools once the Loader
+re-adds the row, but it will not come back with its tab. Restart *after* an
+update, never *during* one.
+
+A restart also clears the session's `/rwm enable`: the command override lasts
+only for the process, and `enabledByDefault` is false, so run `/rwm enable` again
+after every restart.
+
 ---
 
 ## Verifying it
@@ -294,7 +305,7 @@ negative until it restarts.
 ```sh
 cd "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens"
 
-node --test test/                       # 91 unit tests
+node --test test/                       # 92 unit tests
 node tools/verify-against-harness.mjs   # tool schemas against the real DSH validator
 node tools/mount-smoke.mjs              # real Cordis mount + real Session rewrite
 node tools/verify-client-fold.mjs       # browser fold vs the harness's foldSurface()

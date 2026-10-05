@@ -189,10 +189,16 @@ test('apply registers both the tab type and its body', () => {
   const tabs = []
   const bodies = []
   const effects = []
+  const injectedSlots = []
   const ctx = {
     effect: (fn, label) => { effects.push(label); return fn() },
     sidebarRightTabs: { register: definition => { tabs.push(definition); return () => {} } },
-    slots: { register: (options, component) => { bodies.push({ options, component }); return () => {} } },
+    slots: {
+      // The real seat defers the body registration until the slot is declared;
+      // a bare register() before that throws, so the bundle must go through here.
+      inject: (name, register) => { injectedSlots.push(name); return register() },
+      register: (options, component) => { bodies.push({ options, component }); return () => {} },
+    },
   }
   exports.apply(ctx)
   assert.equal(tabs.length, 1)
@@ -200,6 +206,7 @@ test('apply registers both the tab type and its body', () => {
   assert.equal(tabs[0].kind, exports.__internals.KIND)
   assert.equal(tabs[0].title(), 'Model context')
   assert.equal(tabs[0].guide.length, 1)
+  assert.deepEqual(injectedSlots, ['sidebar.right.pane.tab'])
   assert.equal(bodies.length, 1)
   assert.equal(bodies[0].options.name, 'sidebar.right.pane.tab')
   assert.equal(bodies[0].options.key, exports.__internals.ID)
@@ -207,6 +214,23 @@ test('apply registers both the tab type and its body', () => {
   // the "nothing can view this" notice.
   assert.equal(bodies[0].options.key, tabs[0].id)
   assert.equal(typeof bodies[0].component, 'function')
+})
+
+test('apply never calls the slot register before the slot is declared', () => {
+  const { exports } = loadBundle()
+  const order = []
+  const ctx = {
+    effect: fn => fn(),
+    sidebarRightTabs: { register: () => { order.push('tab'); return () => {} } },
+    slots: {
+      // Simulate the declaration not having arrived: the callback is the only
+      // thing allowed to reach register(), and it is not run yet.
+      inject: (name, register) => { order.push('inject:' + name); return () => {} },
+      register: () => { order.push('register'); return () => {} },
+    },
+  }
+  exports.apply(ctx)
+  assert.deepEqual(order, ['tab', 'inject:sidebar.right.pane.tab'])
 })
 
 test('the body renders without a session binding', () => {
