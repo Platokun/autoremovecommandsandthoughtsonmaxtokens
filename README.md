@@ -51,11 +51,18 @@ tool calls, so a fold never renumbers anything. Memory nodes are excluded from
 the plain numbering and live in their own namespace as `rwm-<n>`. Replacement
 copies are skipped, so an original keeps the number it always had.
 
-An agent message's text and thoughts are split into chunks: paragraphs first,
-then list items inside a paragraph. Chunk `3` of message `12` is cited `12.3`.
-Chunks are the point — a few paragraphs are rarely useful as one indivisible
-unit, and citing the smallest thing that answers the question is what keeps the
-total context small.
+An agent message's text and thoughts are split into chunks **one per non-empty
+line**. Chunk `3` of message `12` is cited `12.3`. Models write one thought per
+line — a short paragraph, a plan, a list of next actions — and a whole thought
+bubble is rarely useful as one indivisible unit. A forty-line thought becomes
+forty separately citable pieces, so the agent pulls back the one line it needs
+instead of the entire bubble. Citing the smallest thing that answers the
+question is what keeps the total context small.
+
+The index shows a chunk count (`12 [agent] (5 chunks) ...`) so the agent knows a
+line can be cited on its own, and resolving a whole multi-chunk message returns
+it chunk by chunk with the id that cites only each line — which is how the agent
+learns the split exists and narrows its next request.
 
 The prompt carries a **citable index** of what the agent can no longer see: one
 line per retired number and per memory, oldest first, capped by `indexLimit`.

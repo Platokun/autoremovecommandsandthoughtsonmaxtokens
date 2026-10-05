@@ -54,8 +54,30 @@ describe('chunkText', () => {
     assert.deepEqual(chunkText('- first thing\n- second thing\n- third thing'), ['- first thing', '- second thing', '- third thing'])
   })
 
-  it('keeps a multi-line paragraph whole', () => {
-    assert.deepEqual(chunkText('a sentence\nthat continues'), ['a sentence\nthat continues'])
+  it('splits on every newline, one chunk per line', () => {
+    assert.deepEqual(chunkText('a sentence\nthat continues'), ['a sentence', 'that continues'])
+  })
+
+  it('turns a line-per-thought bubble into one chunk per thought', () => {
+    /* The real case: a plan written as one action per line, no blank lines. */
+    const thought = [
+      'The user wants a clone and build.',
+      'First let me check git log and status.',
+      'Read the README.',
+      'Check global.json for the dotnet version.',
+      'Let me run these in parallel.',
+    ].join('\n')
+    assert.deepEqual(chunkText(thought), [
+      'The user wants a clone and build.',
+      'First let me check git log and status.',
+      'Read the README.',
+      'Check global.json for the dotnet version.',
+      'Let me run these in parallel.',
+    ])
+  })
+
+  it('drops blank lines rather than emitting empty chunks', () => {
+    assert.deepEqual(chunkText('one\n\n\ntwo\n   \nthree'), ['one', 'two', 'three'])
   })
 })
 
@@ -175,9 +197,10 @@ describe('resolveCitations', () => {
     assert.deepEqual(resolved.items.map(item => item.text), ['go'])
   })
 
-  it('resolves a whole agent message', () => {
+  it('returns a whole multi-chunk message chunk by chunk, so the agent can narrow', () => {
     const resolved = resolveCitations(index, events, parseCitations('2'))
-    assert.match(resolved.items[0].text, /para one/)
+    assert.deepEqual(resolved.items.map(item => item.label), ['2.1', '2.2'])
+    assert.deepEqual(resolved.items.map(item => item.text), ['para one', 'para two'])
   })
 
   it('resolves one chunk', () => {
@@ -216,6 +239,12 @@ describe('renderIndex', () => {
     const index = buildIndex(events)
     const lines = renderIndex(index, new Set([1, 2]), 10)
     assert.deepEqual(lines, ['rwm-1 note'])
+  })
+
+  it('reports the chunk count so a line can be cited instead of the whole message', () => {
+    const events = [agent(0, [{ type: 'reasoning', text: 'one\ntwo\nthree' }])]
+    const index = buildIndex(events)
+    assert.deepEqual(renderIndex(index, new Set(), 10), ['1 [agent] (3 chunks) one'])
   })
 
   it('keeps the newest entries when the limit is reached', () => {
