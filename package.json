@@ -1,0 +1,31 @@
+{
+  "name": "@local/dsh-autotrim-context",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lets the agent rewrite its own older context into a durable rwm- memory, and trims retired tool output, so the context meter always shows what will be sent.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib/*.js",
+    "cordis.patch.yml",
+    "overlay.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/",
+    "smoke": "node tools/mount-smoke.mjs",
+    "verify:schemas": "node tools/verify-against-harness.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+# One-off enablement overlay: no install required.
+#
+#   dsh --profile web --patch "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens/overlay.yml"
+#
+# Relative plugin names resolve beside this file; the absolute path is quoted
+# because the directory name contains spaces.
+- insert:
+    - id: dsh-autotrim-context
+      name: '/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens/index.js'
+      config:
+        enabledByDefault: false
+        retainRecentMessages: 8
+        autoStubToolResults: true

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Auto-Trim Thoughts & Commands",
+    "description": "Drops earlier reasoning and command payloads from what the model sees, and keeps every original recallable through context_recall."
+  }
+}

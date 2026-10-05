@@ -1,0 +1,34 @@
+# Bundle patch for @local/dsh-autotrim-context.
+#
+# `dsh plugin --profile <name> add "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens"`
+# installs this package into the profile, and the Loader applies this row.
+#
+# For a one-off run without installing, use an overlay patch file instead
+# (see README.md) whose row names the entry file by absolute path:
+#
+#   - insert:
+#       - id: dsh-autotrim-context
+#         name: '/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens/index.js'
+#         config: {}
+- insert:
+    - id: dsh-autotrim-context
+      name: '@local/dsh-autotrim-context'
+      config:
+        # Off until the user runs /rwm enable in the session.
+        enabledByDefault: false
+        # Messages at the tail of the conversation that are never rewritten.
+        retainRecentMessages: 8
+        # Replace an older tool output with a recall marker, durably.
+        autoStubToolResults: true
+        # A failed result stays intact; the agent has to act on it.
+        keepErrorResults: true
+        # Leading characters of a stubbed output worth keeping (0 = none).
+        toolResultPreviewChars: 0
+        # Publish the rwm- policy and the citable index through the prompt.
+        exposePolicySection: true
+        # Most recent citable entries listed in the prompt index.
+        indexLimit: 40
+        # Characters one rwm_access answer may return before it is refused.
+        accessMaxChars: 8000
+        # Characters one $rwm-<n>-full expansion may return.
+        dereferenceMaxChars: 20000
