@@ -2,7 +2,9 @@
  * `@local/dsh-autotrim-context` — a gateable, citable rewritten memory.
  *
  * Disabled by default. `/rwm enable` turns it on for the session; `/rwm disable`
- * turns it off again. While it is on:
+ * turns it off again, `/rwm status` reports the gate, `/rwm version` reports the
+ * version and the profile source this copy was installed from, and
+ * `/rwm updateplugin` reinstalls it from that source. While it is on:
  *
  *   - `rewrite_memory` folds everything older than the retained tail into one
  *     numbered memory node, `rwm-<n>-<context>`, replacing the model's own
@@ -30,6 +32,10 @@
  *
  * @module @local/dsh-autotrim-context
  */
+
+import { readFileSync, realpathSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import {
   MEMORY_PREFIX,
@@ -62,6 +68,24 @@ export const COMMAND = 'rwm'
 
 /** `$rwm-<n>-full` written by the agent to pull a memory back in. */
 const DEREFERENCE = /\$rwm-(\d+)(?:-full)?\b/g
+
+/** This package's own manifest, read once at activation; an unreadable or unparsable one reports as unknown. */
+const OWN_MANIFEST = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+  } catch {
+    return {}
+  }
+})()
+
+/** The version this copy declares; `unknown` when its own manifest cannot be read. */
+export const VERSION = typeof OWN_MANIFEST.version === 'string' ? OWN_MANIFEST.version : 'unknown'
+
+/** The package name this copy declares, used to find the profile dependency that installed it. */
+const PACKAGE_NAME = typeof OWN_MANIFEST.name === 'string' ? OWN_MANIFEST.name : 'dsh-autotrim-context'
+
+/** The directory this copy runs from: the profile's `node_modules/<name>` when it was installed, the checkout otherwise. */
+const PACKAGE_DIR = fileURLToPath(new URL('.', import.meta.url))
 
 /**
  * Activate the plugin.
@@ -244,9 +268,9 @@ function registerCommand(ctx, isOn, setOn, warn) {
     try {
       scope.commands.register({
         name: COMMAND,
-        description: 'Turn rewritten memory on or off for this session',
-        input: { hint: 'enable | disable | status' },
-        handler: (invocation) => {
+        description: 'Turn rewritten memory on or off, report this build, or update the plugin',
+        input: { hint: 'enable | disable | status | version | updateplugin' },
+        async handler(invocation) {
           const session = invocation.agent?.session
           const verb = invocation.rawInput.trim().toLowerCase()
           if (verb === 'enable') {
@@ -263,13 +287,112 @@ function registerCommand(ctx, isOn, setOn, warn) {
               text: `Rewritten memory is ${isOn(session) ? 'enabled' : 'disabled'} for this session.`,
             }
           }
-          return { kind: 'error', text: `Usage: /${COMMAND} enable | disable | status` }
+          if (verb === 'version') return { kind: 'success', text: versionText(ctx) }
+          if (verb === 'updateplugin') {
+            try {
+              return await updatePlugin(ctx)
+            } catch (error) {
+              return { kind: 'error', text: `Update failed: ${describe(error)}` }
+            }
+          }
+          return { kind: 'error', text: `Usage: /${COMMAND} enable | disable | status | version | updateplugin` }
         },
       })
     } catch (error) {
       warn(`could not register /${COMMAND}: ${describe(error)}`)
     }
   })
+}
+
+/* -------------------------------------------------------------- self-info */
+
+/**
+ * The running profile's dependency entry for this package.
+ *
+ * The entry is found by package name, and for an install recorded under another
+ * name by resolving `node_modules/<name>` to this copy's own directory.
+ *
+ * @param ctx - Cordis context, for the profile the copy runs in.
+ * @returns the dependency name, its recorded spec, and the profile it belongs to, or undefined.
+ */
+function installedDependency(ctx) {
+  const profile = ctx.get?.('profileContext')
+  const dir = profile?.dir
+  if (typeof dir !== 'string' || dir.length === 0) return undefined
+  let manifest
+  try {
+    manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+  } catch {
+    return undefined
+  }
+  const recorded = manifest?.dependencies
+  if (recorded === null || typeof recorded !== 'object') return undefined
+  const name = Object.keys(recorded).find(candidate => candidate === PACKAGE_NAME || resolvesToThisCopy(dir, candidate))
+  if (name === undefined || typeof recorded[name] !== 'string') return undefined
+  return { name, recorded: recorded[name], dir, profile: typeof profile?.name === 'string' ? profile.name : dir }
+}
+
+/** Whether this profile's `node_modules/<name>` really is the directory this copy runs from. */
+function resolvesToThisCopy(dir, name) {
+  try {
+    return realpathSync(join(dir, 'node_modules', name)) === realpathSync(PACKAGE_DIR)
+  } catch {
+    return false
+  }
+}
+
+/** What this build is, and which source the running profile installed it from. */
+function versionText(ctx) {
+  const lines = [`Rewritten Memory ${VERSION}`]
+  const installed = installedDependency(ctx)
+  if (installed === undefined) {
+    lines.push(`No profile dependency holds this copy; it runs from ${PACKAGE_DIR}.`)
+  } else {
+    lines.push(`Installed as ${installed.name} from ${installed.recorded} in profile ${installed.profile}.`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Reinstall this package from the source the running profile recorded for it.
+ *
+ * The spec names the dependency explicitly, `<name>@<source>`. The plugin
+ * manager identifies an installation by the dependency it changed, and a git
+ * source that is already recorded reinstalls to the very same value: an
+ * unnamed spec changes nothing, so the manager could not tell which package it
+ * had just installed and refuses the result as ambiguous. Naming it is what
+ * makes an update of an already-installed plugin legible to the manager.
+ *
+ * @param ctx - Cordis context, for the plugin manager and the profile manifest.
+ * @returns a command result naming the version the reinstall landed.
+ */
+async function updatePlugin(ctx) {
+  const manager = ctx.get?.('pluginManager')
+  if (manager === undefined || typeof manager.installBundle !== 'function') {
+    return {
+      kind: 'error',
+      text: `Update unavailable: this session has no DSH plugin manager. Update the copy at ${PACKAGE_DIR} where it is installed.`,
+    }
+  }
+  const installed = installedDependency(ctx)
+  if (installed === undefined) {
+    return {
+      kind: 'error',
+      text: `Update unavailable: profile ${ctx.get?.('profileContext')?.name ?? 'this profile'} records no dependency for `
+        + `${PACKAGE_NAME}; this copy runs from ${PACKAGE_DIR}. Update it where it is installed.`,
+    }
+  }
+  const result = await manager.installBundle(`${installed.name}@${installed.recorded}`, { enabled: false })
+  if (result?.application === 'failed') {
+    return { kind: 'error', text: `Update failed: ${result.error?.message ?? 'the package manager reported no reason'}` }
+  }
+  if (result?.application === 'cancelled') return { kind: 'error', text: 'Update cancelled; nothing was reloaded.' }
+  const landed = typeof result?.version === 'string' ? result.version : undefined
+  const version = landed === undefined || landed === VERSION ? VERSION : `${landed} (running ${VERSION})`
+  return {
+    kind: 'success',
+    text: `Reinstalled ${installed.name} from ${installed.recorded}: now ${version}. Restart DSH to load the new code.`,
+  }
 }
 
 /* -------------------------------------------------------- durable trimming */

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-autotrim-context",
-  "version": "0.1.0001",
+  "version": "0.1.0002",
   "private": true,
   "description": "Lets the agent rewrite its own older context into a durable rwm- memory, and trims retired tool output, so the context meter always shows what will be sent.",
   "type": "module",

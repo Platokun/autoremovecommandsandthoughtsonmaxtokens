@@ -1,8 +1,18 @@
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
-import { ACCESS_TOOL, COMMAND, apply, inject, name } from '../index.js'
+import { ACCESS_TOOL, COMMAND, VERSION, apply, inject, name } from '../index.js'
 import { MEMORY_PREFIX } from '../lib/memory.js'
+
+/** The package name this plugin is installed under, as its own manifest declares it. */
+const PACKAGE_NAME = '@local/dsh-autotrim-context'
+
+/** The directory this checkout lives in; an aliasing profile links to it. */
+const REPO_DIR = fileURLToPath(new URL('..', import.meta.url))
 
 /**
  * A session stub that performs the real surface operation a replacement asks
@@ -72,7 +82,7 @@ const meterFor = session => ({
 })
 
 /** A minimal Cordis context stand-in. */
-function fakeHarness({ session, meter } = {}) {
+function fakeHarness({ session, meter, services } = {}) {
   const tools = new Map()
   const listeners = new Map()
   const sections = []
@@ -83,7 +93,9 @@ function fakeHarness({ session, meter } = {}) {
     commands: { register: definition => { commands.set(definition.name, definition); return () => commands.delete(definition.name) } },
     on: (event, callback) => { listeners.set(event, callback); return () => listeners.delete(event) },
     inject: (_deps, callback) => callback(ctx),
-    get: key => (key === 'tokenMeter' ? (meter ?? (session === undefined ? undefined : meterFor(session))) : undefined),
+    get: key => (key === 'tokenMeter'
+      ? (meter ?? (session === undefined ? undefined : meterFor(session)))
+      : services?.[key]),
     sessions: { get: () => session },
     llm: { stream: () => ({}) },
     systemPrompt: {
@@ -93,6 +105,31 @@ function fakeHarness({ session, meter } = {}) {
     logger: { warn: () => {} },
   }
   return { ctx, tools, commands, listeners, sections, variables }
+}
+
+/**
+ * A temporary profile whose manifest records the given dependencies.
+ * `alias` adds a `node_modules/<alias>` link back to this checkout, the shape a
+ * profile takes when the package is installed under a name of its own.
+ */
+function profileWith(dependencies, { alias } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'rwm-profile-'))
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'dsh-profile-web', dependencies }))
+  if (alias !== undefined) {
+    mkdirSync(join(dir, 'node_modules'), { recursive: true })
+    symlinkSync(REPO_DIR, join(dir, 'node_modules', alias))
+  }
+  return dir
+}
+
+/** Run `body` against a throwaway profile directory and remove it afterwards. */
+async function withProfile(dependencies, options, body) {
+  const dir = profileWith(dependencies, options)
+  try {
+    return await body(dir)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 const block = (text) => [{ type: 'text', text }]
@@ -375,17 +412,100 @@ describe('context_recall tool', () => {
     apply(ctx, {})
     const command = commands.get(COMMAND)
     assert.ok(command, 'the /rwm command is registered')
-    assert.match(command.handler({ agent: { session }, rawInput: 'status' }).text, /disabled/)
+    assert.match((await command.handler({ agent: { session }, rawInput: 'status' })).text, /disabled/)
     await runPreStep(listeners, session)
     assert.equal(session.appended.length, 0, 'a disabled session is left alone')
 
-    assert.equal(command.handler({ agent: { session }, rawInput: 'enable' }).kind, 'success')
-    assert.match(command.handler({ agent: { session }, rawInput: 'status' }).text, /enabled/)
+    assert.equal((await command.handler({ agent: { session }, rawInput: 'enable' })).kind, 'success')
+    assert.match((await command.handler({ agent: { session }, rawInput: 'status' })).text, /enabled/)
     await runPreStep(listeners, session)
     assert.equal(session.appended.length, 2, 'an enabled session folds')
 
-    assert.equal(command.handler({ agent: { session }, rawInput: 'disable' }).kind, 'success')
-    assert.equal(command.handler({ agent: { session }, rawInput: 'nonsense' }).kind, 'error')
+    assert.equal((await command.handler({ agent: { session }, rawInput: 'disable' })).kind, 'success')
+    const unknown = await command.handler({ agent: { session }, rawInput: 'nonsense' })
+    assert.equal(unknown.kind, 'error')
+    assert.match(unknown.text, /version \| updateplugin/, 'the usage names every verb')
+  })
+
+  it('reports its version and the profile source this copy runs from', async () => {
+    await withProfile({ [PACKAGE_NAME]: 'github:Platokun/autoremovecommandsandthoughtsonmaxtokens' }, {}, async (dir) => {
+      const { ctx, commands } = fakeHarness({ services: { profileContext: { name: 'web', dir } } })
+      apply(ctx, {})
+      const result = await commands.get(COMMAND).handler({ agent: {}, rawInput: 'version' })
+      assert.equal(result.kind, 'success')
+      assert.match(result.text, new RegExp(`Rewritten Memory ${VERSION.replace(/\./g, '\\.')}`))
+      assert.match(result.text, /Installed as @local\/dsh-autotrim-context from github:Platokun\/autoremovecommandsandthoughtsonmaxtokens in profile web\./)
+    })
+  })
+
+  it('finds a profile dependency recorded under another name', async () => {
+    await withProfile({ autotrim: 'github:Platokun/autoremovecommandsandthoughtsonmaxtokens' }, { alias: 'autotrim' }, async (dir) => {
+      const { ctx, commands } = fakeHarness({ services: { profileContext: { name: 'web', dir } } })
+      apply(ctx, {})
+      const result = await commands.get(COMMAND).handler({ agent: {}, rawInput: 'version' })
+      assert.match(result.text, /Installed as autotrim from github:Platokun\/autoremovecommandsandthoughtsonmaxtokens/)
+    })
+  })
+
+  it('says where it runs from when no profile dependency holds it', async () => {
+    const { ctx, commands } = fakeHarness()
+    apply(ctx, {})
+    const result = await commands.get(COMMAND).handler({ agent: {}, rawInput: 'version' })
+    assert.equal(result.kind, 'success')
+    assert.match(result.text, /No profile dependency holds this copy; it runs from /)
+  })
+
+  it('reinstalls the plugin from the recorded source under its own name', async () => {
+    await withProfile({ [PACKAGE_NAME]: 'github:Platokun/autoremovecommandsandthoughtsonmaxtokens' }, {}, async (dir) => {
+      const calls = []
+      const installBundle = async (spec, options) => {
+        calls.push({ spec, options })
+        return { application: 'restart-required', version: '0.2.0' }
+      }
+      const { ctx, commands } = fakeHarness({
+        services: { profileContext: { name: 'web', dir }, pluginManager: { installBundle } },
+      })
+      apply(ctx, {})
+      const result = await commands.get(COMMAND).handler({ agent: {}, rawInput: 'updateplugin' })
+      assert.equal(result.kind, 'success')
+      assert.deepEqual(calls, [{
+        spec: `${PACKAGE_NAME}@github:Platokun/autoremovecommandsandthoughtsonmaxtokens`,
+        options: { enabled: false },
+      }])
+      assert.match(result.text, /now 0\.2\.0 \(running /)
+      assert.match(result.text, /Restart DSH to load the new code\./)
+    })
+  })
+
+  it('reports a failed, cancelled, or impossible update without claiming success', async () => {
+    await withProfile({ [PACKAGE_NAME]: 'github:Platokun/autoremovecommandsandthoughtsonmaxtokens' }, {}, async (dir) => {
+      const services = { profileContext: { name: 'web', dir } }
+      const { ctx, commands } = fakeHarness({ services: { ...services, pluginManager: { installBundle: async () => ({ application: 'failed', error: { message: 'ambiguous-install' } }) } } })
+      apply(ctx, {})
+      const failed = await commands.get(COMMAND).handler({ agent: {}, rawInput: 'updateplugin' })
+      assert.equal(failed.kind, 'error')
+      assert.match(failed.text, /Update failed: ambiguous-install/)
+    })
+
+    await withProfile({ [PACKAGE_NAME]: 'github:Platokun/autoremovecommandsandthoughtsonmaxtokens' }, {}, async (dir) => {
+      const throwing = fakeHarness({ services: { profileContext: { name: 'web', dir }, pluginManager: { installBundle: async () => { throw new Error('no registry') } } } })
+      apply(throwing.ctx, {})
+      const result = await throwing.commands.get(COMMAND).handler({ agent: {}, rawInput: 'updateplugin' })
+      assert.equal(result.kind, 'error')
+      assert.match(result.text, /Update failed: no registry/)
+    })
+
+    const noManager = fakeHarness()
+    apply(noManager.ctx, {})
+    const unavailable = await noManager.commands.get(COMMAND).handler({ agent: {}, rawInput: 'updateplugin' })
+    assert.equal(unavailable.kind, 'error')
+    assert.match(unavailable.text, /no DSH plugin manager/)
+
+    const noProfile = fakeHarness({ services: { pluginManager: { installBundle: async () => ({ application: 'applied' }) } } })
+    apply(noProfile.ctx, {})
+    const unmanaged = await noProfile.commands.get(COMMAND).handler({ agent: {}, rawInput: 'updateplugin' })
+    assert.equal(unmanaged.kind, 'error')
+    assert.match(unmanaged.text, /records no dependency for @local\/dsh-autotrim-context/)
   })
 
   it('fails clearly without a session', async () => {

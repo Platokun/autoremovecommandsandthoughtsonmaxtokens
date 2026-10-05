@@ -6,6 +6,8 @@ honest while it does.
 
 **Off by default.** Run `/rwm enable` in a session to turn it on;
 `/rwm disable` turns it off again and `/rwm status` reports the current state.
+`/rwm version` reports the build that is loaded and the profile source it was
+installed from; `/rwm updateplugin` reinstalls it from that source.
 
 While it is on:
 
@@ -39,6 +41,40 @@ Then, in the session: `/rwm enable`.
 
 Set `enabledByDefault: true` in the row's `config` if you want it on without the
 command. The command's override is per session and lasts for the process.
+
+---
+
+## Keeping an installed copy current
+
+```sh
+/rwm version        # what is loaded, and which profile source installed it
+/rwm updateplugin   # reinstall from that recorded source
+```
+
+`/rwm version` answers "which copy am I actually running?" with two facts: the
+version in this module's own `package.json`, and the dependency the running
+profile recorded — for example
+
+```
+Rewritten Memory 0.1.0001
+Installed as @local/dsh-autotrim-context from github:Platokun/autoremovecommandsandthoughtsonmaxtokens in profile web.
+```
+
+`/rwm updateplugin` hands that source back to DSH's plugin manager as
+`<name>@<source>`. Naming the dependency explicitly is the point: a git source
+that is already recorded reinstalls to the very same value in `package.json`, so
+the manager — which identifies an installation by *the dependency it changed* —
+cannot tell which package it just installed and refuses the run as an ambiguous
+install. The name-qualified spec is attributable either way.
+
+The update goes through the plugin manager, so it obeys the same lockfile,
+registry, and file-restore rules as an install from the plugin page. The new
+code is on disk when the command returns, but the process still runs the old
+module: **restart DSH to load it.**
+
+A copy that no profile dependency holds (started from the `overlay.yml` one-off
+patch, or a checkout run directly) has nothing to reinstall from; the command
+says so and names the directory it is running from.
 
 ---
 
@@ -208,7 +244,7 @@ Unknown keys and out-of-range values fail the plugin at activation.
 ```sh
 cd "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens"
 
-node --test test/                       # 71 unit tests
+node --test test/                       # 79 unit tests
 node tools/verify-against-harness.mjs   # tool schemas against the real DSH validator
 node tools/mount-smoke.mjs              # real Cordis mount + real Session rewrite
 ```
