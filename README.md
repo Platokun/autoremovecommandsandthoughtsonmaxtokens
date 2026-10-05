@@ -239,14 +239,65 @@ Unknown keys and out-of-range values fail the plugin at activation.
 
 ---
 
+## Seeing what the model sees
+
+`lib/client.js` is the plugin's **browser half**: a DSH client bundle that adds a
+**Model context** tab to the Web GUI's right sidebar's guide, next to Workspace
+files and New terminal.
+
+The whole point of a rewrite is that the model stops seeing something the user
+still sees. The tab makes that gap visible, in three presentations over the same
+Session:
+
+| Presentation | Shows |
+|---|---|
+| **Model** | The messages the surface actually resolves to, in order — what the next request would carry. A `«rewritten»` badge marks the nodes that stand in for shadowed ranges. |
+| **Rewritten** | Every replacement copy in the log, each next to the originals it shadowed. |
+| **Diff** | The append-origin transcript (what the user watched happen) against the model-visible surface. |
+
+Every line starts with the durable Session sequence of its event — `[12]` — so a
+line in the panel can be cited to the agent exactly the way the prompt index
+cites it, and `rwm_access` resolves it.
+
+The panel reads the Session's own event window (`ctx.sessions.binding(id).eventSource`)
+and re-derives the surface itself, because DSH publishes no RPC or projection for
+the folded model-visible surface. That re-derivation is not taken on trust:
+`tools/verify-client-fold.mjs` builds real Sessions through the plugin and
+requires the client fold to reproduce `foldSurface()` node for node.
+
+No build step is involved. The bundle is hand-written plain JavaScript in the
+closure-factory form the client-modules loader serves, parses and executes — it
+declares no `dsh.client.external` and requests nothing but `react`, which the
+shell seeds in the frozen platform module table.
+
+### Getting it into a running GUI
+
+The browser half is served from whatever copy the profile installed, and the
+Host reads that copy's `dsh.client` declaration at startup, so:
+
+```sh
+# 1. put this directory into the profile (or: push, then /rwm updateplugin)
+dsh plugin --profile web add "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens"
+
+# 2. restart DSH — a negative client-scan verdict is cached until restart
+```
+
+Then reload the page and pick **Model context** from the right sidebar's guide.
+Editing `lib/client.js` on disk is not enough on its own: the running Host served
+the old bytes, and a package that declared no `dsh.client` at startup stays
+negative until it restarts.
+
+---
+
 ## Verifying it
 
 ```sh
 cd "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens"
 
-node --test test/                       # 79 unit tests
+node --test test/                       # 91 unit tests
 node tools/verify-against-harness.mjs   # tool schemas against the real DSH validator
 node tools/mount-smoke.mjs              # real Cordis mount + real Session rewrite
+node tools/verify-client-fold.mjs       # browser fold vs the harness's foldSurface()
 ```
 
 `tools/mount-smoke.mjs` mounts the plugin into a real Cordis `Context`, builds
@@ -254,6 +305,11 @@ real `@deepseek-ai/dsh-session` Sessions, runs the actual `agent/pre-step` hook,
 and checks that DSH's own surface validator accepts both replacements, that the
 shadow price and replacement range agree, that `foldSurface(snapshotEvents())`
 reproduces the live surface exactly, and that no tool result is orphaned.
+
+`tools/verify-client-fold.mjs` then loads `lib/client.js` through a stub of
+`window.__ModuleLoader__` — the same closure-factory contract the browser uses —
+and compares its fold with the harness's `foldSurface()` over both a memory
+rewrite and a tool-output stub, including a mid-log window.
 
 It earns its keep: it caught `Session.deriveEventMessage` being called with a
 sequence number instead of an event object — something the stubbed unit tests had
@@ -289,3 +345,18 @@ Point `DSH_CHECKOUT` at a different checkout if yours is not
   configuration at activation instead.
 - **Log growth.** Each rewrite appends two events, bounded by how often the agent
   chooses to rewrite.
+- **The panel folds only what is loaded.** The client event window is paginated
+  and message-aligned, so a replacement whose range starts above the oldest loaded
+  event is skipped and the tab says the view is incomplete; scroll the
+  conversation back to load more. A full-log fold would need to page to exhaustion
+  through `ctx.remote.session.page`, whose `throughSeq` comes from a `follow`
+  opening frame.
+- **The panel ignores message projections.** It reads event content directly, so a
+  rewrite path that publishes changed messages through a plugin-owned
+  `SessionMessageProjection` (e.g. image offload) would show the un-projected
+  text. The `rwm-` rewrite and the tool-output stub both carry their content in
+  the replacement event, so neither is affected.
+- **A client bundle must be restarted into place.** The Host reads
+  `exports["./client"]` and each package's `dsh.client` at startup and caches a
+  negative scan until restart, so a freshly installed browser half needs a DSH
+  restart even though no DSH build is involved.
