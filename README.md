@@ -20,6 +20,10 @@ While it is on:
 - `rwm_access` resolves those citations. Each request states its reasoning, which
   is judged against the derived **reasoning lock** of the content.
 - `$rwm-<n>-full` written in a reply pulls a memory's originals back in.
+- **Autoruns** fold every agent **thought** and every **console output** into a
+  `rwm-c-<n>` memory, so every past thought and console output stays accessible
+  via `rwm-c-<n>` — the same deterministic condensation as `rewrite_memory`,
+  always available through citations like `[12, 15-17, rwm-c-3]`.
 
 Nothing is ever deleted. A replacement *shadows* a log entry; access is
 controlled by the lock, not by destruction.
@@ -113,6 +117,7 @@ this plugin exists to save.
 | `15-17` | messages 15 through 17 |
 | `12.3` | chunk 3 of message 12 |
 | `rwm-3` | memory 3, resolved to every original it shadowed |
+| `rwm-c-3` | console-output memory 3, resolved to every original it shadowed |
 
 A tool call resolves to its arguments **and** the output that answered it — the
 call alone is not an answer.
@@ -236,6 +241,9 @@ Unknown keys and out-of-range values fail the plugin at activation.
 | `indexLimit` | `40` | Most recent citable entries listed. |
 | `accessMaxChars` | `8000` | Budget for one `rwm_access` answer. |
 | `dereferenceMaxChars` | `20000` | Budget for one `$rwm-<n>-full` expansion. |
+| `autorunAfterThoughts` | `true` | Fold agent thoughts into `rwm-c-` memories after each. |
+| `autorunAfterConsole` | `true` | Fold console output into `rwm-c-` memories after each. |
+| `condenseSummaryTokens` | `8` | Max salient tokens a condensation summary may list. |
 
 ---
 
@@ -258,6 +266,12 @@ Session:
 Every line starts with the durable Session sequence of its event — `[12]` — so a
 line in the panel can be cited to the agent exactly the way the prompt index
 cites it, and `rwm_access` resolves it.
+
+The transcript is never truncated. Every line the loaded window folds to is
+rendered, however many that is, so the preview cannot end in a "more lines not
+shown" dead end. Rows carry per-row paint containment
+(`content-visibility: auto` with an intrinsic line size), which keeps a
+tens-of-thousands-of-lines transcript scrolling without giving up a line.
 
 The panel reads the Session's own event window (`ctx.sessions.binding(id).eventSource`)
 and re-derives the surface itself, because DSH publishes no RPC or projection for

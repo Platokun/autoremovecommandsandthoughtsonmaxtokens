@@ -166,6 +166,47 @@ test('diffLines reports same, removed and added lines', () => {
   ])
 })
 
+test('renders every transcript line and never truncates the model view', () => {
+  const { exports } = loadBundle()
+  const helpers = exports.__internals
+  const rows = []
+  const React_ = {
+    createElement: (type, props, ...children) => {
+      const node = { type, props, children }
+      if (type === 'div' && props !== null && props !== undefined
+        && typeof children[0] === 'string' && children[0].startsWith('line ')) {
+        rows.push(node)
+      }
+      return node
+    },
+  }
+  const lines = Array.from({ length: 5000 }, (_, index) => 'line ' + String(index))
+  helpers.body(React_, lines)
+  // Every line is in the tree, including the ones past the old 4000-row cap.
+  assert.equal(rows.length, 5000)
+  assert.equal(rows.at(-1).children[0], 'line 4999')
+  // Offscreen rows are paint-contained so the full render stays scrollable.
+  assert.equal(rows[0].props.style.contentVisibility, 'auto')
+})
+
+test('per-line styles merge over the row containment style', () => {
+  const { exports } = loadBundle()
+  const helpers = exports.__internals
+  const styles = []
+  const React_ = {
+    createElement: (type, props) => {
+      if (type === 'div') styles.push(props.style)
+      return { type, props }
+    },
+  }
+  helpers.body(React_, ['x'], () => ({ color: 'red' }))
+  // The row keeps its containment and takes the per-line color; the outer body
+  // wrapper (the last div) is untouched.
+  const row = styles.find(style => style.color === 'red')
+  assert.equal(row.contentVisibility, 'auto')
+  assert.equal(styles.at(-1).contentVisibility, undefined)
+})
+
 test('summarize counts what is sent, logged and rewritten', () => {
   const { exports } = loadBundle()
   const helpers = exports.__internals

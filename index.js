@@ -41,9 +41,14 @@ import {
   MEMORY_PREFIX,
   REWRITE_TOOL,
   buildMemoryMessage,
+  buildConsoleMemoryMessage,
   collectSurfaceEntries,
+  condenseText,
+  CONSOLE_MEMORY_KIND,
+  CONSOLE_MEMORY_PREFIX,
   findPendingRewrite,
   isRewriteApplied,
+  nextConsoleMemoryNumber,
   nextMemoryNumber,
   planMemoryFold,
   resolveConfig,
@@ -51,8 +56,10 @@ import {
 } from './lib/memory.js'
 import {
   buildIndex,
+  eventText,
   judge,
   parseCitations,
+  parseConsoleMemory,
   renderIndex,
   resolveCitations,
 } from './lib/history.js'
@@ -108,6 +115,7 @@ export function apply(ctx, rawConfig) {
   registerTools(ctx, config, isOn)
   registerCommand(ctx, isOn, setOn, warn)
   registerDurableTrim(ctx, config, warn, isOn)
+  registerAutoruns(ctx, config, warn, isOn)
   registerDereference(ctx, config, warn, isOn)
   registerPrompt(ctx, config, warn, isOn)
 }
@@ -416,6 +424,80 @@ function registerDurableTrim(ctx, config, warn, isOn) {
     }
     return next()
   })
+}
+
+/**
+ * Register the two autoruns: after thoughts and after console output.
+ *
+ * Both fold the produced thought or console output into a `rwm-c-<n>` memory so
+ * every past thought and console output stays accessible via `rwm-c-<n>`. The
+ * condensation is deterministic, so the same input always yields the same
+ * memory text; a memory with the same condensed text is never re-created.
+ *
+ * Each autorun runs on `session/event` and appends the condensed memory as a
+ * replacement copy of the original event. The memory itself is already a
+ * `rwm-c-` node, so its own `session/event` pass is skipped — this makes the
+ * autoruns idempotent without a separate pending state.
+ */
+function registerAutoruns(ctx, config, warn, isOn) {
+  ctx.on('session/event', (session, event) => {
+    if (!isOn(session)) return
+    const text = eventText(event)
+    if (text.length === 0) return
+    if (parseConsoleMemory(text) !== null) return
+
+    const hasReasoning = event.type === 'assistant/message' && hasReasoningBlocks(event)
+    const isConsole =
+      (event.type === 'user/message' || event.type === 'assistant/message') &&
+      !hasReasoning &&
+      !text.startsWith(CONSOLE_MEMORY_PREFIX)
+    if (!hasReasoning && !isConsole) return
+
+    const condensed = condenseText(text, config.condenseSummaryTokens)
+    if (condensed.length === 0) return
+
+    const existing = findExistingConsoleMemory(session, condensed)
+    if (existing !== null) return
+
+    const number = nextConsoleMemoryNumber(session.snapshotEvents())
+    const memoryMessage = buildConsoleMemoryMessage(condensed, number)
+    appendConsoleMemory(ctx, session, event, memoryMessage, warn)
+  })
+}
+
+/** Whether an assistant message carries reasoning blocks. */
+function hasReasoningBlocks(event) {
+  const content = event.data?.message?.content
+  if (!Array.isArray(content)) return false
+  return content.some(block => isRecord(block) && block.type === 'reasoning')
+}
+
+/** Whether a session already holds a memory with the same condensed text. */
+function findExistingConsoleMemory(session, condensed) {
+  const events = session?.events ?? []
+  for (const event of events) {
+    if (event?.type !== 'user/message') continue
+    const memory = parseConsoleMemory(eventText(event))
+    if (memory !== null && memory.context === condensed) return event.seq
+  }
+  return null
+}
+
+/** Append a `rwm-c-<n>-<condensed>` memory node to the session. */
+function appendConsoleMemory(ctx, session, event, memoryMessage, warn) {
+  try {
+    session.append('user/message', memoryMessage, {
+      surfaceOp: { op: 'replace', startSeq: event.seq, endSeq: event.seq },
+      sourceEventSeqs: [event.seq],
+    })
+  } catch (error) {
+    warn(`could not append console memory: ${describe(error)}`)
+  }
+}
+
+/** Whether a value is a non-array object. */
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function applyMemoryRewrite(ctx, config, session, warn) {

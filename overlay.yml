@@ -11,3 +11,6 @@
         enabledByDefault: false
         retainRecentMessages: 8
         autoStubToolResults: true
+        autorunAfterThoughts: true
+        autorunAfterConsole: true
+        condenseSummaryTokens: 8

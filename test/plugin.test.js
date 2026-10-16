@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 
 import { ACCESS_TOOL, COMMAND, VERSION, apply, inject, name } from '../index.js'
 import { MEMORY_PREFIX } from '../lib/memory.js'
+import { parseConsoleMemory } from '../lib/history.js'
 
 /** The package name this plugin is installed under, as its own manifest declares it. */
 const PACKAGE_NAME = '@local/dsh-autotrim-context'
@@ -91,7 +92,18 @@ function fakeHarness({ session, meter, services } = {}) {
   const ctx = {
     tools: { register: definition => { tools.set(definition.name, definition); return () => tools.delete(definition.name) } },
     commands: { register: definition => { commands.set(definition.name, definition); return () => commands.delete(definition.name) } },
-    on: (event, callback) => { listeners.set(event, callback); return () => listeners.delete(event) },
+    on: (event, callback) => {
+      const set = listeners.get(event) ?? new Set()
+      set.add(callback)
+      listeners.set(event, set)
+      return () => {
+        const current = listeners.get(event)
+        if (current) {
+          current.delete(callback)
+          if (current.size === 0) listeners.delete(event)
+        }
+      }
+    },
     inject: (_deps, callback) => callback(ctx),
     get: key => (key === 'tokenMeter'
       ? (meter ?? (session === undefined ? undefined : meterFor(session)))
@@ -180,6 +192,16 @@ function makeSession({ longOutput, isError, seeds = [], prices } = {}) {
   return new FakeSession(conv.surface, { seedEvents: [...conv.logOnly, ...seeds], prices })
 }
 
+/**
+ * A minimal session: a system prompt and a single user message.
+ */
+function minimalSession() {
+  return new FakeSession([
+    { seq: 0, type: 'system/message', message: systemMessage('s1', 'prompt'), data: systemMessage('s1', 'prompt') },
+    { seq: 1, type: 'user/message', message: userMessage('u1', 'go'), data: userMessage('u1', 'go') },
+  ])
+}
+
 /** Seed a durable, already-finished `rewrite_memory` call. */
 function rewriteCall(memory, keep, seq = 7, callId = 'rc1') {
   return {
@@ -198,9 +220,65 @@ function rewriteCall(memory, keep, seq = 7, callId = 'rc1') {
 
 /** Run the plugin's `agent/pre-step` listener once. */
 async function runPreStep(listeners, session) {
-  const listener = listeners.get('agent/pre-step')
-  assert.ok(listener, 'the plugin registered an agent/pre-step listener')
-  return listener({ agent: { session }, signal: { aborted: false } }, () => Promise.resolve({ kind: 'enter' }))
+  const callbacks = listeners.get('agent/pre-step')
+  assert.ok(callbacks instanceof Set, 'the plugin registered an agent/pre-step listener')
+  return callbacks.values().next().value({ agent: { session }, signal: { aborted: false } }, () => Promise.resolve({ kind: 'enter' }))
+}
+
+/**
+ * Append an event to the session and fire every plugin's `session/event`
+ * listener for it, so the autoruns see it exactly like the harness does.
+ */
+function appendAndEvent(listeners, session, type, data, options) {
+  const event = session.append(type, data, options)
+  const callbacks = listeners.get('session/event')
+  assert.ok(callbacks instanceof Set, 'the plugin registered a session/event listener')
+  for (const callback of callbacks) {
+    callback(session, event)
+  }
+  return event
+}
+
+/**
+ * Append an assistant message that carries reasoning blocks (a thought).
+ */
+function appendThought(listeners, session, seq, reasoning, text) {
+  const thought = {
+    id: `a${seq}`,
+    role: 'assistant',
+    source: { kind: 'model', provider: 'p', model: 'm' },
+    content: [
+      { type: 'reasoning', text: reasoning },
+      { type: 'text', text },
+    ],
+  }
+  return appendAndEvent(listeners, session, 'assistant/message', { message: thought }, {
+    surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
+    sourceEventSeqs: [seq],
+  })
+}
+
+/**
+ * Append a plain user/assistant message with no reasoning blocks (console
+ * output).
+ */
+function appendConsole(listeners, session, seq, text) {
+  const message = text.startsWith('user:') ? userMessage(`u${seq}`, text) : assistantText(`a${seq}`, text)
+  const data = message.role === 'assistant' ? { message } : message
+  const type = message.role === 'assistant' ? 'assistant/message' : 'user/message'
+  return appendAndEvent(listeners, session, type, data, {
+    surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
+    sourceEventSeqs: [seq],
+  })
+}
+
+/**
+ * Consume every `rwm-c-` memory node currently on the session surface.
+ */
+function consoleMemories(session) {
+  return session.events.filter(
+    event => event.type === 'user/message' && parseConsoleMemory(event.data?.content?.[0]?.text) !== null,
+  )
 }
 
 describe('plugin surface', () => {
@@ -363,6 +441,92 @@ describe('durable tool-output trimming', () => {
     apply(ctx, { enabledByDefault: true, retainRecentMessages: 2, autoStubToolResults: false })
     await runPreStep(listeners, session)
     assert.equal(session.appended.length, 0)
+  })
+})
+
+describe('autoruns', () => {
+  it('registers a session/event listener for the autoruns', () => {
+    const { ctx, listeners } = fakeHarness()
+    apply(ctx, { enabledByDefault: true })
+    assert.ok(listeners.has('session/event'))
+  })
+
+  it('folds an agent thought into an rwm-c- memory', () => {
+    const session = minimalSession()
+    const { ctx, listeners } = fakeHarness({ session })
+    apply(ctx, { enabledByDefault: true })
+
+    appendThought(listeners, session, 2, 'reasoning', 'thought text')
+
+    const memories = consoleMemories(session)
+    assert.equal(memories.length, 1)
+    assert.match(memories[0].data.content[0].text, /^rwm-c-\d+-/)
+    assert.match(memories[0].data.content[0].text, /thought text/)
+  })
+
+  it('folds console output into an rwm-c- memory', () => {
+    const session = minimalSession()
+    const { ctx, listeners } = fakeHarness({ session })
+    apply(ctx, { enabledByDefault: true })
+
+    appendConsole(listeners, session, 2, 'user: some console output')
+
+    const memories = consoleMemories(session)
+    assert.equal(memories.length, 1)
+    assert.match(memories[0].data.content[0].text, /^rwm-c-\d+-/)
+    assert.match(memories[0].data.content[0].text, /some console output/)
+  })
+
+  it('does not fold the same thought twice', () => {
+    const session = minimalSession()
+    const { ctx, listeners } = fakeHarness({ session })
+    apply(ctx, { enabledByDefault: true })
+
+    appendThought(listeners, session, 2, 'reasoning', 'thought text')
+    appendThought(listeners, session, 3, 'reasoning', 'thought text')
+
+    const memories = consoleMemories(session)
+    assert.equal(memories.length, 1, 'the same condensed text yields one memory')
+  })
+
+  it('does not fold the same console output twice', () => {
+    const session = minimalSession()
+    const { ctx, listeners } = fakeHarness({ session })
+    apply(ctx, { enabledByDefault: true })
+
+    appendConsole(listeners, session, 2, 'user: some console output')
+    appendConsole(listeners, session, 3, 'user: some console output')
+
+    const memories = consoleMemories(session)
+    assert.equal(memories.length, 1, 'the same condensed text yields one memory')
+  })
+
+  it('does not create a memory node twice', () => {
+    const session = minimalSession()
+    const { ctx, listeners } = fakeHarness({ session })
+    apply(ctx, { enabledByDefault: true })
+
+    appendThought(listeners, session, 2, 'reasoning', 'thought text')
+    appendConsole(listeners, session, 3, 'user: more output')
+
+    // The memory nodes are already on the surface; their own session/event
+    // pass must not create duplicate memories.
+    appendThought(listeners, session, 4, 'reasoning', 'thought text')
+    appendConsole(listeners, session, 5, 'user: more output')
+
+    const memories = consoleMemories(session)
+    assert.equal(memories.length, 2)
+  })
+
+  it('does nothing when the autoruns are disabled', () => {
+    const session = minimalSession()
+    const { ctx, listeners } = fakeHarness({ session })
+    apply(ctx, { enabledByDefault: false })
+
+    appendThought(listeners, session, 2, 'reasoning', 'thought text')
+    appendConsole(listeners, session, 3, 'user: some console output')
+
+    assert.equal(consoleMemories(session).length, 0)
   })
 })
 
