@@ -1,8 +1,8 @@
 {
   "name": "@local/dsh-autotrim-context",
-  "version": "0.1.0006",
+  "version": "0.1.0010",
   "private": true,
-  "description": "Lets the agent rewrite its own older context into a durable rwm- memory, and trims retired tool output, so the context meter always shows what will be sent.",
+  "description": "Lets the agent rewrite its own older context into a durable rwm- memory, trim retired tool output, keep one copy of each file, and compact or wipe the whole conversation on request, so the context meter always shows what will be sent.",
   "type": "module",
   "exports": {
     ".": "./index.js",
@@ -23,7 +23,10 @@
     "test": "node --test test/",
     "smoke": "node tools/mount-smoke.mjs",
     "verify:schemas": "node tools/verify-against-harness.mjs",
-    "verify:client-fold": "node tools/verify-client-fold.mjs"
+    "verify:client-fold": "node tools/verify-client-fold.mjs",
+    "verify:file-dedupe": "node tools/verify-file-dedupe.mjs",
+    "verify:compact": "node tools/verify-compact.mjs",
+    "verify:no-write": "node tools/verify-no-write.mjs"
   },
   "dsh": {
     "bundle": {

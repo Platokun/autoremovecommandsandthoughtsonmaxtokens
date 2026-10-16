@@ -48,17 +48,30 @@ import {
   REWRITE_TOOL,
   buildMemoryMessage,
   buildConsoleMemoryMessage,
+  buildCompactMemory,
+  buildFileRecord,
+  chooseCompactRoute,
+  collectFileRecords,
   collectSurfaceEntries,
+  compactSystemPrompt,
+  compactUserPrompt,
   condenseText,
   CONSOLE_MEMORY_KIND,
   CONSOLE_MEMORY_PREFIX,
   findPendingRewrite,
+  isDuplicateContent,
+  isMemoryText,
   isRewriteApplied,
   nextConsoleMemoryNumber,
   nextMemoryNumber,
+  planCompact,
+  planFileDedupe,
   planMemoryFold,
+  planWipe,
   resolveConfig,
+  stubDuplicateContent,
   stubToolResultContent,
+  verifyFileRecords,
 } from './lib/memory.js'
 import {
   buildIndex,
@@ -124,7 +137,7 @@ export function apply(ctx, rawConfig) {
   }
 
   registerTools(ctx, config)
-  registerCommand(ctx, isForced, setForced, warn)
+  registerCommand(ctx, config, isForced, setForced, warn)
   registerDurableTrim(ctx, config, warn, isForced)
   registerAutoruns(ctx, config, warn, isForced)
   registerDereference(ctx, config, warn)
@@ -280,13 +293,13 @@ function access(session, citations, reason, maxChars) {
 
 /* ----------------------------------------------------------------- command */
 
-function registerCommand(ctx, isForced, setForced, warn) {
+function registerCommand(ctx, config, isForced, setForced, warn) {
   ctx.inject(['commands'], (scope) => {
     try {
       scope.commands.register({
         name: COMMAND,
-        description: 'Force rewritten memory on or off for the session, report this build, or update the plugin',
-        input: { hint: 'enable | disable | status | version | updateplugin' },
+        description: 'Force rewritten memory on or off for the session, compact or wipe the context, report this build, or update the plugin',
+        input: { hint: 'enable | disable | status | compact | wipe | version | updateplugin' },
         async handler(invocation) {
           const session = invocation.agent?.session
           const verb = invocation.rawInput.trim().toLowerCase()
@@ -316,6 +329,22 @@ function registerCommand(ctx, isForced, setForced, warn) {
             }
           }
           if (verb === 'version') return { kind: 'success', text: versionText(ctx) }
+          if (verb === 'compact') {
+            try {
+              const report = await compactSession(ctx, config, session, warn)
+              return { kind: 'success', text: describeCompact(report) }
+            } catch (error) {
+              return { kind: 'error', text: `Compact failed: ${describe(error)}` }
+            }
+          }
+          if (verb === 'wipe') {
+            try {
+              const report = wipeSession(ctx, config, session, warn)
+              return { kind: 'success', text: describeWipe(report) }
+            } catch (error) {
+              return { kind: 'error', text: `Wipe failed: ${describe(error)}` }
+            }
+          }
           if (verb === 'updateplugin') {
             try {
               return await updatePlugin(ctx)
@@ -323,7 +352,10 @@ function registerCommand(ctx, isForced, setForced, warn) {
               return { kind: 'error', text: `Update failed: ${describe(error)}` }
             }
           }
-          return { kind: 'error', text: `Usage: /${COMMAND} enable | disable | status | version | updateplugin` }
+          return {
+            kind: 'error',
+            text: `Usage: /${COMMAND} enable | disable | status | version | compact | wipe | updateplugin`,
+          }
         },
       })
     } catch (error) {
@@ -332,8 +364,72 @@ function registerCommand(ctx, isForced, setForced, warn) {
   })
 }
 
-/* -------------------------------------------------------------- self-info */
+/**
+ * How a shrink mode describes itself in a reply.
+ *
+ * The record always carries `file <path> <read|written> <timestamp> <bytes>b -><seq>`;
+ * what varies is how much of the document rides along behind it, and the reply must
+ * say which, because "recorded by path and time only" is a lie under `partial`.
+ */
+const SHRINK_SUMMARY = {
+  reference: 'pointer only — the record cites the source event, no file text',
+  partial: 'pointer plus the opening lines of each file',
+  full: 'pointer plus the whole document',
+}
 
+/**
+ * One line summarising a compact pass, for the command's reply.
+ *
+ * Everything printed here is derived from the report: the shrink sentence follows
+ * the mode that actually ran, and corrections are surfaced rather than swallowed.
+ *
+ * @param report - the report from {@link compactSession}.
+ * @returns human-readable text.
+ */
+function describeCompact(report) {
+  if (report.compacted === 0) return `Nothing compacted: ${report.reason}.`
+  const route = report.route === undefined
+    ? 'deterministic wording'
+    : `${report.route.provider}/${report.route.model} (${report.route.reason})`
+  const fallback = report.error === undefined ? '' : ` The model was not used: ${report.error}.`
+  const shrink = SHRINK_SUMMARY[report.fileShrink] ?? report.fileShrink
+  const records = report.files === 0
+    ? 'no file records'
+    : `${report.files} file record${report.files === 1 ? '' : 's'} (${shrink})`
+  const corrections = report.corrections ?? []
+  const invented = report.invented ?? []
+  let verified = ''
+  if (corrections.length > 0) {
+    verified += ` Corrected ${corrections.length} inaccurate file record${corrections.length === 1 ? '' : 's'}`
+      + ` against the session log: ${corrections.slice(0, 3).join('; ')}${corrections.length > 3 ? '; …' : ''}.`
+  }
+  if (invented.length > 0) {
+    verified += ` Marked ${invented.length} unverifiable file${invented.length === 1 ? '' : 's'}`
+      + ` as UNVERIFIED: ${invented.slice(0, 3).join(', ')}${invented.length > 3 ? ', …' : ''}.`
+  }
+  return `Compacted ${report.compacted} entries into rwm-${report.number}: ${report.before} surface nodes `
+    + `became ${report.after}, carrying ${records} and `
+    + `${report.tools} tool line${report.tools === 1 ? '' : 's'} (${route}).${fallback}${verified}`
+    + ' Retired content is still readable with rwm_access.'
+}
+
+/**
+ * One line summarising a wipe, for the command's reply.
+ *
+ * @param report - the report from {@link wipeSession}.
+ * @returns human-readable text.
+ */
+function describeWipe(report) {
+  if (report.wiped === 0) return `Nothing wiped: ${report.reason}.`
+  const shrink = SHRINK_SUMMARY[report.fileShrink] ?? report.fileShrink
+  const records = report.files > 0
+    ? `, and ${report.files} file record${report.files === 1 ? '' : 's'} survive (${shrink})`
+    : ''
+  return `Wiped ${report.wiped} surface nodes into rwm-${report.number}; the initial system prompt is intact`
+    + `${records}. Retired content is still readable with rwm_access.`
+}
+
+/* -------------------------------------------------------------- self-info */
 /**
  * The running profile's dependency entry for this package.
  *
@@ -439,10 +535,24 @@ function registerDurableTrim(ctx, config, warn, isForced) {
       } catch (error) {
         warn(`memory rewrite failed: ${describe(error)}; continuing the turn`)
       }
+      /*
+       * Forced-only as well: leave each file's content in context exactly once.
+       * This runs before the generic stub so a duplicate is retired by its own
+       * file-specific marker rather than being swallowed as generic retired
+       * output, and so the survivor can be protected from that generic stub.
+       */
+      let fileSurvivors = new Set()
+      if (isForced(session) && config.dedupeFileReads) {
+        try {
+          fileSurvivors = dedupeFileDuplicates(ctx, config, session, warn)
+        } catch (error) {
+          warn(`duplicate-file retirement failed: ${describe(error)}; continuing the turn`)
+        }
+      }
       /* Automatic trimming is forced-only: it retires output nobody asked about. */
       if (isForced(session) && config.autoStubToolResults) {
         try {
-          stubRetiredToolResults(ctx, config, session, warn)
+          stubRetiredToolResults(ctx, config, session, warn, fileSurvivors)
         } catch (error) {
           warn(`tool-output trimming failed: ${describe(error)}; continuing the turn`)
         }
@@ -547,7 +657,7 @@ function applyMemoryRewrite(ctx, config, session, warn) {
   return plan
 }
 
-function stubRetiredToolResults(ctx, config, session, warn) {
+function stubRetiredToolResults(ctx, config, session, warn, protectedSeqs = new Set()) {
   const entries = collectSurfaceEntries(session)
   const cutoff = entries.length - config.retainRecentMessages
   if (cutoff <= 0) return 0
@@ -556,6 +666,14 @@ function stubRetiredToolResults(ctx, config, session, warn) {
     const { seq, message } = entries[index]
     if (message.role !== 'tool') continue
     if (config.keepErrorResults && message.isError === true) continue
+    /*
+     * Never stub the copy the file dedupe left in context: the point of that
+     * pass is that the file is present exactly once, and a generic stub here
+     * would leave it present zero times. A node the dedupe pass already retired
+     * keeps its own duplicate marker, which says more than a generic stub does.
+     */
+    if (protectedSeqs.has(seq)) continue
+    if (isDuplicateContent(message.content)) continue
     const built = stubToolResultContent(message.content, config)
     if (built === null) continue
     const event = typeof session.eventAt === 'function' ? session.eventAt(seq) : undefined
@@ -569,6 +687,82 @@ function stubRetiredToolResults(ctx, config, session, warn) {
     stubbed += 1
   }
   return stubbed
+}
+
+/**
+ * Leave each file's content in the model's context exactly once.
+ *
+ * Newest copy wins. Every older copy of the same file is replaced by a bounded
+ * recall marker, and one altered-memory note states what happened without
+ * framing it as a call the agent made — the agent reads that its context was
+ * altered, not that it altered it.
+ *
+ * Only whole call/result groups that sit entirely outside the retained tail are
+ * retired, so a duplicate created inside the current step survives that step and
+ * the next pass picks it up.
+ *
+ * @param ctx - Cordis context, for the token meter.
+ * @param config - resolved configuration.
+ * @param session - live harness session.
+ * @param warn - warning sink.
+ * @returns the surface seqs of the copies that survived, for the caller to protect.
+ */
+function dedupeFileDuplicates(ctx, config, session, warn) {
+  const survivors = new Set()
+  const entries = collectSurfaceEntries(session)
+  if (entries.length === 0) return survivors
+  const { retire, survivors: newest } = planFileDedupe(entries, config.retainRecentMessages)
+  /*
+   * Every file's surviving copy is protected whether or not this pass had
+   * anything to retire: on the pass after a retirement the duplicate is already
+   * a marker, so there is nothing left to retire, and only this set keeps the
+   * generic stub from taking the single remaining copy as well.
+   */
+  for (const occurrence of newest.values()) survivors.add(occurrence.seq)
+  if (retire.length === 0) return survivors
+
+  const retired = []
+  for (const occurrence of retire) {
+    const event = typeof session.eventAt === 'function' ? session.eventAt(occurrence.seq) : undefined
+    if (event === undefined || event.type !== 'tool/result') continue
+    const built = stubDuplicateContent(event.data?.message?.content, occurrence.file, occurrence.survivorLabel)
+    if (built === null) continue
+    appendReplacement(ctx, session, {
+      type: 'tool/result',
+      data: { ...event.data, message: { ...event.data.message, content: built.content } },
+      shadowedSeqs: [occurrence.seq],
+      warn,
+    })
+    retired.push(occurrence)
+  }
+  if (retired.length === 0) return survivors
+
+  appendAlteredMemoryNote(session, retired, warn)
+  return survivors
+}
+
+/**
+ * Note that context was altered, as a memory the agent reads.
+ *
+ * The note is written as an `rwm-<n>-` node, so the index lists it, `rwm_access`
+ * resolves it, and the agent can pull the retired copies back if it needs them.
+ * Nothing about it says the agent asked for the retirement.
+ */
+function appendAlteredMemoryNote(session, retired, warn) {
+  try {
+    const files = [...new Set(retired.map(occurrence => occurrence.file))]
+    const listing = files.length <= 4
+      ? files.join(', ')
+      : `${files.slice(0, 4).join(', ')} and ${files.length - 4} more`
+    const number = nextMemoryNumber(session.snapshotEvents())
+    const note = `${retired.length} older cop${retired.length === 1 ? 'y' : 'ies'} of `
+      + `${listing} ${retired.length === 1 ? 'was' : 'were'} replaced in this context to keep one copy of each file. `
+      + `The newest copy stays; each retired copy is still readable with ${ACCESS_TOOL}, citing the retired number. `
+      + 'This was not a tool call you made.'
+    session.append('user/message', buildMemoryMessage(note, number), { surfaceOp: 'append' })
+  } catch (error) {
+    warn(`could not append the altered-memory note: ${describe(error)}`)
+  }
 }
 
 /**
@@ -616,6 +810,252 @@ function shadowPrice(ctx, session, shadowedSeqs) {
     total += price
   }
   return total
+}
+
+/* --------------------------------------------------------------- compact */
+
+/**
+ * Ask a model to write the compact memory, falling back to the deterministic one.
+ *
+ * The call is deliberately optional and never fatal: if no permitted route is
+ * available, the call fails, or the model returns nothing usable, the caller
+ * still compacts with the deterministic wording. A compaction that silently
+ * did nothing because a helper model was unreachable would be the worst
+ * outcome, so the model only ever replaces the *phrasing*, never the decision.
+ *
+ * @param ctx - Cordis context, for the `llm` service.
+ * @param config - resolved configuration.
+ * @param session - live session, for the route and the model call's framing.
+ * @param plan - the plan from {@link planCompact}.
+ * @param warn - warning sink.
+ * @returns `{ text, route, error }`; `text` is always usable.
+ */
+async function condenseWithModel(ctx, config, session, plan, warn) {
+  const fallback = buildCompactMemory(plan)
+  if (!config.compactUseModel) return { text: fallback, route: undefined }
+  const llm = ctx.get?.('llm')
+  if (llm === undefined || typeof llm.stream !== 'function') {
+    return { text: fallback, route: undefined, error: 'the llm service is unavailable' }
+  }
+  let available = []
+  try {
+    available = (llm.listProviders?.() ?? []).map(provider => provider?.id).filter(id => typeof id === 'string')
+  } catch (error) {
+    return { text: fallback, route: undefined, error: `could not list providers: ${describe(error)}` }
+  }
+  const chosen = chooseCompactRoute(config, available, sessionModelRoute(session), await modelsByProvider(llm))
+  if (chosen.error !== undefined) return { text: fallback, route: undefined, error: chosen.error }
+  try {
+    const raw = await runCompactCall(ctx, config, session, plan, chosen)
+    if (typeof raw !== 'string' || raw.trim().length === 0) {
+      return { text: fallback, route: chosen, error: 'the model returned no text' }
+    }
+    /*
+     * The model was told to copy file records verbatim and invent nothing. That
+     * is a request, not a guarantee, so every record it wrote is checked against
+     * what the session actually holds before the summary is allowed to land.
+     */
+    const verified = verifyFileRecords(raw.trim(), plan.files)
+    return {
+      text: verified.text,
+      route: chosen,
+      corrections: verified.corrections,
+      invented: verified.invented,
+    }
+  } catch (error) {
+    warn(`compact: the model call failed, using the deterministic memory: ${describe(error)}`)
+    return { text: fallback, route: chosen, error: describe(error) }
+  }
+}
+
+/** The session's own provider/model route, when the session exposes one. */
+function sessionModelRoute(session) {
+  const selection = session?.model ?? session?.modelSelection ?? session?.requestHeader?.model
+  if (selection === undefined || selection === null || typeof selection !== 'object') return undefined
+  const provider = selection.provider
+  const model = selection.model
+  if (typeof provider !== 'string' || typeof model !== 'string') return undefined
+  return { provider, model }
+}
+
+/**
+ * Ask each advertised provider which models it offers.
+ *
+ * Used only to name a real model on an implicit pick. A provider that refuses or
+ * hangs must not break the compaction, so every lookup is bounded and a failure
+ * simply leaves that provider without a model — which the route guard then
+ * reports as "advertises no model" instead of calling an empty route.
+ */
+async function modelsByProvider(llm) {
+  const listed = {}
+  if (typeof llm.listModels !== 'function') return listed
+  let providers = []
+  try {
+    providers = (llm.listProviders?.() ?? []).map(provider => provider?.id).filter(id => typeof id === 'string')
+  } catch {
+    return listed
+  }
+  await Promise.all(providers.map(async (id) => {
+    try {
+      const models = await llm.listModels(id)
+      const ids = (models ?? []).map(model => (typeof model === 'string' ? model : model?.id)).filter(entry => typeof entry === 'string')
+      if (ids.length > 0) listed[id] = ids
+    } catch {
+      /* A provider that cannot be interrogated simply contributes no models. */
+    }
+  }))
+  return listed
+}
+
+/**
+ * Stream one auxiliary compaction call and assemble its text.
+ *
+ * The `llm/stream` surface is the same one the harness's own auxiliary features
+ * use, so no provider-specific code lives here: the plugin names a route and
+ * reads text back.
+ */
+async function runCompactCall(ctx, config, session, plan, route) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), config.compactTimeoutMs)
+  try {
+    const chunks = []
+    const stream = ctx.llm.stream({
+      provider: route.provider,
+      model: route.model,
+      system: compactSystemPrompt(),
+      messages: [{ role: 'user', content: [{ type: 'text', text: compactUserPrompt(plan) }] }],
+      maxTokens: config.compactMaxTokens,
+      signal: controller.signal,
+    })
+    for await (const chunk of stream) {
+      const text = chunkText(chunk)
+      if (text.length > 0) chunks.push(text)
+    }
+    return chunks.join('')
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Pull text out of one streamed chunk, tolerating the several shapes the service uses. */
+function chunkText(chunk) {
+  if (chunk === null || chunk === undefined) return ''
+  if (typeof chunk === 'string') return chunk
+  if (typeof chunk.text === 'string') return chunk.text
+  const delta = chunk.delta ?? chunk.content
+  if (typeof delta === 'string') return delta
+  if (Array.isArray(delta)) {
+    let text = ''
+    for (const block of delta) {
+      if (block !== null && typeof block === 'object' && typeof block.text === 'string') text += block.text
+    }
+    return text
+  }
+  return ''
+}
+
+/**
+ * Compact the whole conversation into one numbered memory.
+ *
+ * This is the start-to-finish pass: everything from the first foldable node to
+ * the retained tail is replaced by a single `rwm-<n>-` node. Files are never
+ * carried as bytes — each becomes one `file <path> <read|written> <timestamp>`
+ * record, so the agent knows the file and its moment and re-reads the content
+ * from disk when it needs it.
+ *
+ * @param ctx - Cordis context.
+ * @param config - resolved configuration.
+ * @param session - live session.
+ * @param warn - warning sink.
+ * @returns a report for the command to print.
+ */
+async function compactSession(ctx, config, session, warn) {
+  const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : []
+  const entries = collectSurfaceEntries(session)
+  const plan = planCompact(entries, {
+    keepRecent: config.compactKeepRecent,
+    events,
+    keepErrors: config.keepErrorResults,
+    fileShrink: config.compactFileShrink,
+  })
+  if (plan === null) {
+    return { compacted: 0, reason: 'nothing to compact: the conversation is already at or below the retained tail' }
+  }
+
+  const { text, route, error, corrections, invented } = await condenseWithModel(ctx, config, session, plan, warn)
+  const fileShrink = config.compactFileShrink
+  const before = entries.length
+  const number = nextMemoryNumber(events)
+  appendReplacement(ctx, session, {
+    type: 'user/message',
+    data: buildMemoryMessage(`compacted:${text}`, number),
+    shadowedSeqs: plan.shadowedSeqs,
+    warn,
+  })
+  return {
+    compacted: plan.coveredCount,
+    before,
+    after: collectSurfaceEntries(session).length,
+    number,
+    files: plan.files.length,
+    tools: plan.tools.length,
+    route,
+    error,
+    corrections: corrections ?? [],
+    invented: invented ?? [],
+    fileShrink,
+  }
+}
+
+/**
+ * Wipe everything the model can see except the initial system prompt.
+ *
+ * The system prompt is the frame the agent reasons inside and the one thing the
+ * user asked to keep, so node 0 is never replaced. Everything after it collapses
+ * into a single memory that still carries the file records, because otherwise the
+ * agent would lose track of what it had touched.
+ *
+ * @param ctx - Cordis context.
+ * @param config - resolved configuration.
+ * @param session - live session.
+ * @param warn - warning sink.
+ * @returns a report for the command to print.
+ */
+function wipeSession(ctx, config, session, warn) {
+  const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : []
+  const entries = collectSurfaceEntries(session)
+  const plan = planWipe(entries)
+  if (plan === null) {
+    return { wiped: 0, reason: 'nothing to wipe: only the system prompt is on the surface' }
+  }
+  const records = collectFileRecordsFor(entries.slice(plan.startIndex, plan.endIndex + 1), events)
+  const lines = ['context wiped by request; only the initial system prompt remains']
+  for (const record of records) {
+    lines.push(buildFileRecord(record.file, {
+      action: record.action,
+      bytes: record.bytes,
+      seqs: [record.latestSeq ?? record.seqs[record.seqs.length - 1]],
+      shrink: config.compactFileShrink,
+      content: record.content,
+    }))
+  }
+  const number = nextMemoryNumber(events)
+  appendReplacement(ctx, session, {
+    type: 'user/message',
+    data: buildMemoryMessage(`wiped:${lines.join('\n')}`, number),
+    shadowedSeqs: plan.shadowedSeqs,
+    warn,
+  })
+  return { wiped: plan.shadowedSeqs.length, number, files: records.length, fileShrink: config.compactFileShrink }
+}
+
+/** File records for a slice of surface entries, newest write winning. */
+function collectFileRecordsFor(covered, events) {
+  try {
+    return [...collectFileRecords(covered, events).values()]
+  } catch {
+    return []
+  }
 }
 
 /* ------------------------------------------------------------ dereference */
@@ -706,12 +1146,13 @@ function registerPrompt(ctx, config, warn) {
           order: config.sectionOrder,
           text: [
             '## Rewritten memory',
-            `When active, context beginning "${MEMORY_PREFIX}<n>-" is a memory you wrote yourself to replace history you chose to forget,`,
-            'and the numbered index below is what you can no longer see.',
-            `- Cite it with ${ACCESS_TOOL}: "12, 15-17, rwm-3", plus your reasoning. The reasoning is checked against a derived lock,`,
-            '  so asking for something the content does not contain is refused.',
-            '- Write $rwm-<n>-full in a reply to pull a memory\u2019s originals back in.',
-            `- ${REWRITE_TOOL} folds older history into a new numbered memory.`,
+            `"${MEMORY_PREFIX}<n>-" is a memory you wrote to replace history you forgot; the index below lists what you cannot see.`,
+            `Cite [12, 15-17, rwm-3] with reasoning via ${ACCESS_TOOL}: content that contradicts your reasoning is refused.`,
+            '$rwm-<n>-full recalls a memory\u2019s originals.',
+            `${REWRITE_TOOL} folds older history into a new memory.`,
+            `When forced, each file stays in context once (newest copy wins; older copies become recall markers, and an "${MEMORY_PREFIX}<n>-" note reports it \u2014 not a call you made).`,
+            '`/rwm compact` rewrites the whole conversation into one memory; `/rwm wipe` keeps only the system prompt.',
+            'A compacted file is a `file <path> <read|written> <timestamp> <bytes>b -><seq>` record; the `->` seq is the real content, recalled with `rwm_access`.',
           ].join('\n'),
         })
       }

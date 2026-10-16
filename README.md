@@ -31,6 +31,16 @@ the citation tools are always live, and only the automatic passes wait for
   output stays accessible via `rwm-c-<n>` — the same deterministic condensation
   as `rewrite_memory`, always available through citations like
   `[12, 15-17, rwm-c-3]`.
+- **Forced mode only:** no file's content sits in the context twice. When a file
+  is read or edited again, the older copy is retired behind a recall marker — the
+  newest copy wins — and an `rwm-<n>-` **altered-memory note** says the context
+  was changed without presenting it as a call the agent made.
+- **On request:** `/rwm compact` rewrites the whole conversation from start to
+  finish as one `rwm-<n>-` memory, and `/rwm wipe` leaves only the initial system
+  prompt. A file is remembered as a **record** — path, action, timestamp, size —
+  never as its bytes, so the memory cannot go stale and the file on disk is never
+  touched. A model can write the summary if you name a cheap one; by default the
+  wording is deterministic and nothing is spent.
 
 Nothing is ever deleted. A replacement *shadows* a log entry; access is
 controlled by the lock, not by destruction.
@@ -207,6 +217,207 @@ prices that exact range.
 
 ---
 
+## One copy per file
+
+While the automatic passes are forced on, a file's content occupies the context
+once. Every time a file is read or edited, any **older copy of that same file**
+is replaced by a recall marker, so re-reading a file never doubles it:
+
+```
+14 [read] {"file_path":"/repo/src/a.js"} ...   <- marker: earlier copy retired
+21 [read] {"file_path":"/repo/src/a.js"} ...   <- the copy that stays
+rwm-4-1 older copy of a.js was replaced in this context to keep one copy ...
+```
+
+What the pass does and does not do:
+
+- **Newest copy wins.** The last read or edit of a file is the one that stays;
+  everything earlier for that file becomes a marker pointing at it.
+- **A note, not a confession.** The retirement is reported as an `rwm-<n>-`
+  altered-memory note — *"this was not a tool call you made"*. The agent reads
+  that its context changed without being told it asked for the change. The note
+  is an ordinary citable memory, so `rwm_access` resolves it and
+  `$rwm-<n>-full` pulls the retired copies back.
+- **Detection is by path, not by bytes.** Two reads of one path are one file even
+  if the bytes differ between them, which is the intended rule: the newest copy
+  is the current one. Paths are compared normalised (`./a/../b.js` and `a\b.js`
+  are one file) and case-insensitively.
+- **Only reads and edits count.** A call that names a file under a read-ish tool
+  name is tracked; a `bash` call is not, however much output it prints.
+- **The originals survive.** The retired copy is shadowed, not deleted: its bytes
+  stay in the log, reachable through the citation tools, exactly like every other
+  rewrite here.
+
+It converges rather than landing all at once. Retiring means replacing a whole
+tool-call group, and a group that overlaps the retained tail or the running step
+cannot be split, so a duplicate created inside the current step survives that
+step and the next pass retires it. The generic tool-output trimming is aware of
+this pass: it never stubs the surviving copy of a file (which would leave zero
+copies) and never overwrites a duplicate marker with its own generic stub.
+
+`dedupeFileReads: false` turns the pass off. `/rwm disable` does too, because the
+whole pass is part of the forced set — with the feature off, a session behaves
+exactly as it did before, and `rewrite_memory` keeps working as always.
+
+---
+
+## Start to finish: `/rwm compact`
+
+Everything above is incremental. `/rwm compact` is not: it takes the whole
+conversation — the first foldable node through the retained tail — and replaces
+it with **one** numbered memory. `/rwm wipe` goes further and leaves only the
+initial system prompt.
+
+```
+/rwm compact     # the whole conversation becomes one rwm-<n>- memory
+/rwm wipe        # everything except the initial system prompt goes
+```
+
+Both are manual: they are not part of the automatic passes and do not require
+`/rwm enable`.
+
+### The memory is a record with a pointer, not a copy
+
+Every file a session touched becomes a record that **cites the session event it
+came from**, so the agent can walk back to the real thing:
+
+```
+rwm-7-compacted:earlier work compacted (8 entries)
+files: 2
+file /repo/src/alpha.js read 2026-10-16T03:21:10Z 690b ->214
+file /repo/src/beta.js written 2026-10-16T03:21:10Z 660b ->218
+tools: 1
+tool bash: 4 tests passed 1 test skipped
+asked:
+please tidy up the alpha module,now update beta.js
+```
+
+Path, action, timestamp, size, and `-><seq>` — a real, resolvable citation back
+to the event that read or wrote the file, not a filesystem symlink and not a
+copy. The agent knows *what* exists, *when* it last changed, and *where to look*.
+
+How much of the document rides along behind the pointer is the **shrink mode**
+(`compactFileShrink`):
+
+| Mode | The record carries |
+|---|---|
+| `reference` | the pointer alone — no file text at all |
+| `partial` (default) | the pointer plus up to 3 opening lines, clipped, elided with `...` |
+| `full` | the pointer plus the whole document |
+
+`partial` is the default because the opening lines are a strong recognition hint
+at a few tokens each, while `reference` is what you want when the memory must be
+as small as possible. Either way the bytes remain recoverable: the citation is
+dereferenceable, and the original tool result is still in the log.
+
+A read followed by a write of one file collapses to a single `written` record,
+because the current state is the thing worth remembering.
+
+Every other tool result becomes one clipped line, errors included — "this
+failed" is exactly what a compacted context must not lose. Repetition is folded:
+the same command run twelve times becomes one line marked `x12`, so a long
+session's hundred test runs cost a line, not a hundred. Lines are clipped at a
+word boundary, and the list is capped (`toolLineLimit`, default 40) with an
+honest count of what was dropped. Agent prose keeps its first line. The memory's
+size is bounded by the number of distinct tools and files, not by how long the
+conversation was.
+
+### What a rewrite costs at the provider
+
+DSH has no prefix-cache API to call — the cache belongs to the provider, and the
+harness only reports what it did after the fact (`cacheReadTokens` /
+`cacheWriteTokens` on each assistant message). Prefix stability is therefore an
+*emergent* property of the request pipeline rather than something a plugin can
+set. The harness states the invariant plainly: a log projected by a per-node pure
+function yields requests that are append-extensions of their predecessors
+whenever the header is unchanged, so only the rewritten tail is re-billed.
+
+That leaves one thing this plugin can get wrong, and it guards it explicitly. A
+replacement may only retire **one contiguous, ascending run of the surface**.
+Everything before the run stays byte-identical to what the provider already
+cached; a run with a hole in it, or a reversed one, would rewrite bytes the
+provider had already paid to cache and silently re-bill the request from that
+point on. Both planners assert this before emitting a plan, and
+`isContiguousTail` in [lib/memory.js](lib/memory.js) is the single predicate. It
+is checked where the run is *derived* rather than at the append site, because
+there the seqs come from the same slice they would be checked against — a guard
+at that point could never fire.
+
+Two costs are inherent, because the model genuinely must see something different:
+compaction itself, and a change to the system prompt at surface node 0. Node 0 is
+never compacted or wiped, which is why `/rwm wipe` keeps it and why a compaction
+is a one-time full-price event rather than a recurring one.
+
+### A model's summary is verified, not trusted
+
+Instructing a model to "copy the records verbatim and invent nothing" is a
+request, not a guarantee. So when a model writes the memory, every `file ...`
+line it produces is **checked against the records actually collected from the
+session**, and repaired:
+
+- a line naming a file the session never touched becomes
+  `file <path> UNVERIFIED (no such tool call in this session)` — the model's
+  intent is kept, but the falsehood is not;
+- a line misstating a real file's action, size, timestamp, or `->` pointer is
+  **rewritten to the true record**.
+
+Model *prose* is never rewritten: a good summary wrapped around one bad path
+keeps the summary and loses only the bad path. The reply tells you what was
+corrected and what could not be verified. With `compactUseModel: false` (the
+default) there is no model output to verify, and this pass does nothing.
+
+### Choosing the model
+
+By default `/rwm compact` is **deterministic**: no model is called, no tokens are
+spent, and the same conversation always produces the same memory. Set
+`compactUseModel: true` to hand the rewriting to a model instead.
+
+That model is **never chosen silently from a costly route**. A coding session's
+own route is usually the expensive one, so:
+
+- `compactProvider` + `compactModel` name the route explicitly; an explicit pair
+  always wins, including a `deepseek` route — that is how you say "yes, this one".
+- Without a pair, an implicit pick must clear `compactDenyProviders` (default
+  `deepseek,dsk`, so your local `spark` model is chosen instead), and the model id
+  is resolved from what the chosen provider actually advertises rather than
+  guessed.
+- If nothing permitted is available, the pass **refuses the model and says so**
+  rather than quietly falling back to the route you were avoiding — and still
+  compacts, deterministically. The same applies if a permitted provider advertises
+  no model at all: an uncallable empty route is reported, not attempted.
+
+A model that is unreachable, slow, or returns nothing usable is likewise never
+fatal: the pass falls back to the deterministic memory and reports why. The model
+only ever replaces the *wording*, never the decision to compact — and what it
+writes is verified as described above.
+
+### What survives
+
+`/rwm wipe` keeps node 0 — the system prompt — because that is the frame the
+agent reasons inside and the one thing that was asked to be kept. Everything
+after it collapses into a single memory that still lists the file records, so a
+wipe does not lose track of which files were touched.
+
+Nothing is deleted in either case. Both passes shadow through the same
+`replace` op as every other rewrite here: the replaced nodes stay in the log,
+carry their `compaction/prune` shadow price, and remain readable through
+`rwm_access` and `$rwm-<n>-full`. Neither pass writes to disk — there is a
+verifier for that, below.
+
+### Terse prompt
+
+The instruction text this plugin contributes to the system prompt is kept short
+deliberately: it is re-sent on every single request, so a verbose policy is a
+permanent tax on the context it exists to save. The block describing memories,
+citations, the file rule, and both commands is ~700 characters — about a fifth
+smaller than the version that described *less*, since each line now carries its
+weight and the tool schemas supply the detail.
+
+`exposePolicySection: false` drops the block entirely for a session that does not
+need the reminder, leaving only the citable index.
+
+---
+
 ## Tools
 
 ### `rewrite_memory`
@@ -248,6 +459,7 @@ Unknown keys and out-of-range values fail the plugin at activation.
 | `enabledByDefault` | `false` | Force the automatic passes on without `/rwm enable`. |
 | `retainRecentMessages` | `8` | Tail messages never rewritten. |
 | `autoStubToolResults` | `true` | Replace retired tool output with a recall marker. |
+| `dedupeFileReads` | `true` | Keep one copy of each file: retire older reads and edits. |
 | `keepErrorResults` | `true` | Never shorten a failed tool result. |
 | `toolResultPreviewChars` | `0` | Leading characters of a stubbed output worth keeping. |
 | `exposePolicySection` | `true` | Publish the policy section and the citable index. |
@@ -258,6 +470,30 @@ Unknown keys and out-of-range values fail the plugin at activation.
 | `autorunAfterThoughts` | `true` | Fold agent thoughts into `rwm-c-` memories after each. |
 | `autorunAfterConsole` | `true` | Fold console output into `rwm-c-` memories after each. |
 | `condenseSummaryTokens` | `8` | Max salient tokens a condensation summary may list. |
+| `compactKeepRecent` | `1` | Newest surface nodes `/rwm compact` always leaves alone. |
+| `compactFileShrink` | `'partial'` | How much file text a record carries: `reference`, `partial`, or `full`. |
+| `compactUseModel` | `false` | Let a model write the compact memory instead of the deterministic wording. |
+| `compactProvider` | `''` | Provider route for that model; pair it with `compactModel`. |
+| `compactModel` | `''` | Model id for that route; pair it with `compactProvider`. |
+| `compactMaxTokens` | `700` | Output-token cap for the compaction call. |
+| `compactTimeoutMs` | `30000` | Deadline for the compaction call before it falls back. |
+| `compactDenyProviders` | `'deepseek,dsk'` | Provider fragments never chosen implicitly. |
+| `compactAllowProviders` | `''` | Exact provider ids allowed despite a deny fragment. |
+
+Choosing a model for `/rwm compact` without spending on the frontier:
+
+```yaml
+config:
+  compactUseModel: true
+  compactProvider: local-spark     # your own model
+  compactModel: spark-x-t-4b
+  compactDenyProviders: deepseek,dsk
+```
+
+An explicit `compactProvider`/`compactModel` pair is always honoured — writing
+`deepseek` there is how you deliberately choose it. The deny list governs only
+the *implicit* pick, so leaving the pair unset can never silently land on a route
+you were avoiding.
 
 ---
 
@@ -334,10 +570,13 @@ after every restart to get the automatic passes back. The agent's own
 ```sh
 cd "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens"
 
-node --test test/                       # 104 unit tests
+node --test test/                       # 171 unit tests
 node tools/verify-against-harness.mjs   # tool schemas against the real DSH validator
 node tools/mount-smoke.mjs              # real Cordis mount + real Session rewrite
 node tools/verify-client-fold.mjs       # browser fold vs the harness's foldSurface()
+node tools/verify-file-dedupe.mjs       # one copy per file, on real DSH sessions
+node tools/verify-compact.mjs           # /rwm compact and /rwm wipe, on real sessions
+node tools/verify-no-write.mjs          # neither pass writes to disk
 ```
 
 `tools/mount-smoke.mjs` mounts the plugin into a real Cordis `Context`, builds
@@ -351,9 +590,46 @@ reproduces the live surface exactly, and that no tool result is orphaned.
 and compares its fold with the harness's `foldSurface()` over both a memory
 rewrite and a tool-output stub, including a mid-log window.
 
+`tools/verify-file-dedupe.mjs` is the file rule's own proof. On real Sessions it
+requires that two reads of one file leave **one** full copy and one marker, five
+reads leave one copy and four markers, no read ever leaves history, the retired
+bytes stay recoverable from the log, the shadow price is non-zero, an unforced
+session is left byte-identical, and two distinct files are never mistaken for
+duplicates.
+
 It earns its keep: it caught `Session.deriveEventMessage` being called with a
 sequence number instead of an event object — something the stubbed unit tests had
-encoded wrongly.
+encoded wrongly — and, for the file rule, it is what proved that the generic
+tool-output trimming could otherwise stub a file's single surviving copy.
+
+`tools/verify-compact.mjs` proves the whole-conversation passes. Its twenty
+scenarios run on real Sessions and require that compact collapses the
+conversation to one numbered memory while the system prompt stays first and
+unaltered; that a file appears as a
+`file <path> <read|written> <timestamp> <bytes>b -><seq>` record carrying a
+resolvable pointer back to its source event; that the three shrink modes are
+genuinely distinct — `reference` carries no file text, `partial` (the default)
+carries a bounded hint and never the whole document, `full` carries all of it —
+and that **the reply names the mode that actually ran**; that tool output
+survives as one clipped line and a 2MB message becomes a 261-character memory;
+that a **developer message** and a tool result that arrived **without a call**
+are compacted like any other context; that a wipe leaves exactly the system
+prompt plus one memory and still lists which files were touched; that a session
+holding only the system prompt, and a completely empty session, are graceful
+no-ops rather than errors; that repeated compact/wipe passes interleave safely;
+that the `compaction/prune` price covers **exactly** the nodes that left the
+surface and all of them are cited by the replacement; that `verifyFileRecords`
+rewrites a record that contradicts the session log and marks a file the session
+never touched as `UNVERIFIED`; that every replacement in a real compact+wipe
+retires one **contiguous surface run**, so the provider's cached prefix still
+applies; and that the model path behaves: no call when
+`compactUseModel` is false, the configured route when it is true, a **refused**
+denied route, and a deterministic fallback when the model throws.
+
+`tools/verify-no-write.mjs` is the adversarial one. It wraps every `node:fs`
+mutator and runs compact — both deterministic and model-backed — followed by a
+wipe, then fails if any of them was called. "Files unaltered" is the load-bearing
+promise of the whole feature, and reading the memory text cannot prove it.
 
 Point `DSH_CHECKOUT` at a different checkout if yours is not
 `/home/naruzkurai/deepseek-harness`.
@@ -367,11 +643,54 @@ Point `DSH_CHECKOUT` at a different checkout if yours is not
   described — a fresh, empty-context reviewer that reads the request's reasoning
   and the memory's lock and answers yes/no/maybe independently, with a re-ask
   interval after a failure — is not implemented. The lock, the denial record,
-  and the "refusal is never re-sent as context" rule are all in place for it; the
-  reviewer itself needs a one-shot `ctx.llm.stream()` call and is the next step.
+  the "refusal is never re-sent as context" rule are in place for it, and
+  `/rwm compact` now provides the working `ctx.llm.stream()` call to build it
+  from; the reviewer itself is the next step.
+- **Compaction trusts the tool name to classify a call.** A call is a *file* when
+  its name looks file-ish and its arguments carry a known path key: it becomes a
+  `file ...` record. Everything else — including a `bash` call that printed a
+  file — becomes one clipped tool line. Nothing here reads the disk, so no
+  record can be more accurate than the call it came from.
+- **A compaction's summary is lossy by construction.** The deterministic memory
+  keeps paths, actions, counts, errors, and one clipped line per tool; it does
+  not keep the wording of what was said. That is the point, but it means a
+  compacted conversation is recalled through `rwm_access`, not re-read. The
+  retained tail (`compactKeepRecent`, default 1) is the only part left verbatim.
+- **Only the file records of a model summary are verified.** `/rwm compact` tells
+  the model to copy `file ...` records verbatim and invent nothing, and
+  `verifyFileRecords` enforces that part: a record contradicting the log is
+  rewritten to the truth, and a file the session never touched is marked
+  `UNVERIFIED`. The model's *prose* is deliberately untouched, so a summary can
+  still misdescribe what happened in words. That is why the deterministic path is
+  the default and the model path is opt-in.
+- **Prefix-cache friendliness is structural, not tunable.** There is no
+  prefix-cache API in DSH, so this plugin cannot request a cache block, pin a
+  cache key, or measure a hit. What it can do — and does — is refuse to emit a
+  replacement that would invalidate more of the prefix than necessary, which is
+  checked on every plan. Whether the provider then reports a hit is observable
+  only after the fact, in `cacheReadTokens` per assistant message.
+- **`/rwm wipe` is not undoable from the model's view.** It shadows everything
+  after the system prompt; the retired nodes stay in the log and remain readable
+  through `rwm_access`, but the model will not see them again unless it cites
+  them. There is no confirmation prompt.
+- **Compaction is manual and unguarded.** It does not require `/rwm enable`, has
+  no dry run, and no size threshold — `/rwm compact` always compacts whatever is
+  foldable. `/rwm` on its own reports status without changing anything.
 - **Triage of a tool call is not automatic.** There is no flow yet for marking a
   call "no useful information", writing the note, or refusing repeats pending
   fulfilled reasoning. Nothing is blocked today; `rwm_access` is the only gate.
+- **The file rule converges, it does not land at once.** One pass retires what is
+  foldable; a copy created inside the current step becomes foldable on the next
+  pass, so a duplicate can survive the step that made it. Four passes are enough
+  for every shape the verifier builds, and nothing is left behind indefinitely.
+- **The file rule trusts the tool name and the argument shape.** A call is treated
+  as naming a file when its name looks read-ish and its arguments carry a known
+  path key. A tool that hides its path under another key, or that prints a file's
+  contents under a name like `bash`, is not deduped. Paths are compared as
+  normalised strings — no symlink resolution, no volume case rules, and no read
+  from disk, because this module never touches the filesystem.
+- **Only the surface is visible to it.** A copy that was already folded away is
+  out of reach and stays reachable only through `rwm_access`.
 - **Reload of folded history.** `rwm_access` resolves shadowed originals from
   `sourceEventSeqs`, which every replacement carries, so citations keep working
   across a reload. Numbers are derived from the log, so they are stable too.

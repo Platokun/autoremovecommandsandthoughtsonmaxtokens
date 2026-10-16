@@ -644,7 +644,7 @@ describe('context_recall tool', () => {
     assert.equal((await command.handler({ agent: { session }, rawInput: 'disable' })).kind, 'success')
     const unknown = await command.handler({ agent: { session }, rawInput: 'nonsense' })
     assert.equal(unknown.kind, 'error')
-    assert.match(unknown.text, /version \| updateplugin/, 'the usage names every verb')
+    assert.match(unknown.text, /version \| compact \| wipe \| updateplugin/, 'the usage names every verb')
   })
 
   it('reports its version and the profile source this copy runs from', async () => {
