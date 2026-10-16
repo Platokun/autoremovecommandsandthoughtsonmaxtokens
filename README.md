@@ -4,33 +4,40 @@ A DeepSeek Harness (DSH) plugin that lets the agent **rewrite its own older
 context into numbered memories it writes itself**, and keeps the context meter
 honest while it does.
 
-**Off by default.** Run `/rwm enable` in a session to turn it on;
-`/rwm disable` turns it off again and `/rwm status` reports the current state.
-`/rwm version` reports the build that is loaded and the profile source it was
-installed from; `/rwm updateplugin` reinstalls it from that source.
+**The agent is never gated.** `rewrite_memory`, `rwm_access`, and `$rwm-<n>-full`
+work in every session: the agent can rewrite its own history, cite it, and pull a
+memory back without any command. `/rwm enable` *forces* the feature on for the
+session — the automatic passes then run at every tool call and at every message
+end — `/rwm disable` returns to agent-initiated only, and `/rwm status` reports
+which mode a session is in. `/rwm version` reports the build that is loaded and
+the profile source it was installed from; `/rwm updateplugin` reinstalls it from
+that source.
 
-While it is on:
+Installing the plugin is not the same as forcing it: the agent-facing tool and
+the citation tools are always live, and only the automatic passes wait for
+`/rwm enable` (or `enabledByDefault: true`).
 
-- `rewrite_memory` folds everything older than the retained tail into one
-  numbered node, `rwm-<n>-<context>` — a memory the agent wrote itself.
-- Retired **tool output** is automatically replaced by a short recall marker.
+- `rewrite_memory` (never gated) folds everything older than the retained tail
+  into one numbered node, `rwm-<n>-<context>` — a memory the agent wrote itself.
+- `rwm_access` resolves citations. Each request states its reasoning, which is
+  judged against the derived **reasoning lock** of the content.
+- `$rwm-<n>-full` written in a reply pulls a memory's originals back in.
 - Every user message, agent message, and tool call carries a **stable number**,
   and an agent message's thoughts and paragraphs are split into citable
   **chunks**. The agent cites them as `[12, 15-17, 12.3, rwm-3]`.
-- `rwm_access` resolves those citations. Each request states its reasoning, which
-  is judged against the derived **reasoning lock** of the content.
-- `$rwm-<n>-full` written in a reply pulls a memory's originals back in.
-- **Autoruns** fold every agent **thought** and every **console output** into a
-  `rwm-c-<n>` memory, so every past thought and console output stays accessible
-  via `rwm-c-<n>` — the same deterministic condensation as `rewrite_memory`,
-  always available through citations like `[12, 15-17, rwm-c-3]`.
+- **Forced mode only:** retired **tool output** is automatically replaced by a
+  short recall marker, and **autoruns** fold every agent **thought** and every
+  **console output** into a `rwm-c-<n>` memory, so every past thought and console
+  output stays accessible via `rwm-c-<n>` — the same deterministic condensation
+  as `rewrite_memory`, always available through citations like
+  `[12, 15-17, rwm-c-3]`.
 
 Nothing is ever deleted. A replacement *shadows* a log entry; access is
 controlled by the lock, not by destruction.
 
 ---
 
-## Enable it
+## Install and enable it
 
 ```sh
 # one-off, no install
@@ -41,10 +48,13 @@ dsh plugin --profile web add "/500gb/dsh plugins/autoremovecommandsandthoughtson
 dsh --profile web --dump-config      # confirm the row composed
 ```
 
-Then, in the session: `/rwm enable`.
+Loading the plugin is enough for the agent to rewrite on its own. Then, in the
+session, `/rwm enable` forces the automatic passes on: tool-output trimming at
+every tool call, and the thought/console autoruns at every message end.
 
-Set `enabledByDefault: true` in the row's `config` if you want it on without the
-command. The command's override is per session and lasts for the process.
+Set `enabledByDefault: true` in the row's `config` if you want that forced mode
+on without the command. The command's override is per session and lasts for the
+process.
 
 ---
 
@@ -206,6 +216,10 @@ prices that exact range.
 | `memory` (required) | The replacement text, as terse as possible. |
 | `keep_recent_messages` | Newest messages kept verbatim (default `retainRecentMessages`, minimum 1). |
 
+Never gated: the agent may call this in a session that was never enabled, and the
+call lands at the next pre-step. `/rwm enable` only adds the automatic passes on
+top.
+
 The call is durable on its own — it is a logged `tool/call`, so no bespoke event
 type is needed. The fold lands at the next `agent/pre-step`, where the surface is
 quiescent and no tool result can be stranded without its call. Applying is
@@ -231,7 +245,7 @@ Unknown keys and out-of-range values fail the plugin at activation.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabledByDefault` | `false` | Start on without `/rwm enable`. |
+| `enabledByDefault` | `false` | Force the automatic passes on without `/rwm enable`. |
 | `retainRecentMessages` | `8` | Tail messages never rewritten. |
 | `autoStubToolResults` | `true` | Replace retired tool output with a recall marker. |
 | `keepErrorResults` | `true` | Never shorten a failed tool result. |
@@ -310,7 +324,8 @@ update, never *during* one.
 
 A restart also clears the session's `/rwm enable`: the command override lasts
 only for the process, and `enabledByDefault` is false, so run `/rwm enable` again
-after every restart.
+after every restart to get the automatic passes back. The agent's own
+`rewrite_memory` calls do not depend on it and keep working either way.
 
 ---
 
@@ -319,7 +334,7 @@ after every restart.
 ```sh
 cd "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens"
 
-node --test test/                       # 92 unit tests
+node --test test/                       # 104 unit tests
 node tools/verify-against-harness.mjs   # tool schemas against the real DSH validator
 node tools/mount-smoke.mjs              # real Cordis mount + real Session rewrite
 node tools/verify-client-fold.mjs       # browser fold vs the harness's foldSurface()

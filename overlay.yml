@@ -1,4 +1,6 @@
-# One-off enablement overlay: no install required.
+# One-off overlay: loads the plugin, no install required. The agent's own
+# rewrite_memory/rwm_access/$rwm-<n>-full tools are live immediately;
+# enabledByDefault:false leaves the automatic passes to /rwm enable.
 #
 #   dsh --profile web --patch "/500gb/dsh plugins/autoremovecommandsandthoughtsonmaxtokens/overlay.yml"
 #

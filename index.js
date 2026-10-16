@@ -1,23 +1,29 @@
 /**
- * `@local/dsh-autotrim-context` — a gateable, citable rewritten memory.
+ * `@local/dsh-autotrim-context` — a self-rewriting, citable memory.
  *
- * Disabled by default. `/rwm enable` turns it on for the session; `/rwm disable`
- * turns it off again, `/rwm status` reports the gate, `/rwm version` reports the
- * version and the profile source this copy was installed from, and
- * `/rwm updateplugin` reinstalls it from that source. While it is on:
+ * The agent is never gated: `rewrite_memory`, `rwm_access`, and `$rwm-<n>-full`
+ * work in every session, whether or not the feature was enabled in chat. What
+ * `/rwm enable` does is *force* the feature on for the session — the automatic
+ * passes then run at every tool call (`agent/pre-step`) and at every message end
+ * (`session/event`) — and `/rwm disable` returns the session to agent-initiated
+ * rewrites only. `/rwm status` reports which mode a session is in, `/rwm version`
+ * reports the version and the profile source this copy was installed from, and
+ * `/rwm updateplugin` reinstalls it from that source.
  *
- *   - `rewrite_memory` folds everything older than the retained tail into one
- *     numbered memory node, `rwm-<n>-<context>`, replacing the model's own
- *     history with a memory it wrote itself.
- *   - Retired tool output is replaced by a short recall marker.
+ *   - `rewrite_memory` (never gated) folds everything older than the retained
+ *     tail into one numbered memory node, `rwm-<n>-<context>`, replacing the
+ *     model's own history with a memory it wrote itself.
+ *   - `rwm_access` resolves citations. Each request states its reasoning,
+ *     which is judged against the derived **reasoning lock** of the content —
+ *     the "I need 2022 data, but this is all 2023" check.
+ *   - `$rwm-<n>-full` in the agent's own reply pulls a memory's originals back in.
  *   - Every user message, agent message, and tool call carries a **stable
  *     number**, and an agent message's thoughts and paragraphs are split into
  *     citable **chunks**. Replies carry a compact index of what the model can no
  *     longer see, so it can cite `[12, 15-17, rwm-3]`.
- *   - `rwm_access` resolves those citations. Each request states its reasoning,
- *     which is judged against the derived **reasoning lock** of the content —
- *     the "I need 2022 data, but this is all 2023" check.
- *   - `$rwm-<n>-full` in the agent's own reply pulls a memory's originals back in.
+ *   - **Forced mode only:** retired tool output is replaced by a short recall
+ *     marker, and the autoruns fold every thought and console output into a
+ *     `rwm-c-<n>` memory at message end.
  *
  * Every rewrite is a durable surface replacement preceded by its
  * `compaction/prune` shadow price, so the context meter, the composition
@@ -101,10 +107,15 @@ const PACKAGE_DIR = fileURLToPath(new URL('.', import.meta.url))
  */
 export function apply(ctx, rawConfig) {
   const config = resolveConfig(rawConfig)
-  /** Explicit per-session overrides; absent means the configured default. */
+  /**
+   * Explicit per-session forced-mode overrides; absent means the configured
+   * default. Forced mode is what `/rwm enable` sets: the automatic passes run at
+   * every tool call and every message end. It is never a precondition for the
+   * agent's own `rewrite_memory`, `rwm_access`, or `$rwm-<n>-full` request.
+   */
   const overrides = new Map()
-  const isOn = session => overrides.get(String(session?.id)) ?? config.enabledByDefault
-  const setOn = (session, on) => { overrides.set(String(session?.id), on) }
+  const isForced = session => overrides.get(String(session?.id)) ?? config.enabledByDefault
+  const setForced = (session, on) => { overrides.set(String(session?.id), on) }
 
   const warn = (message) => {
     try {
@@ -112,12 +123,12 @@ export function apply(ctx, rawConfig) {
     } catch { /* Logging must never break a turn. */ }
   }
 
-  registerTools(ctx, config, isOn)
-  registerCommand(ctx, isOn, setOn, warn)
-  registerDurableTrim(ctx, config, warn, isOn)
-  registerAutoruns(ctx, config, warn, isOn)
-  registerDereference(ctx, config, warn, isOn)
-  registerPrompt(ctx, config, warn, isOn)
+  registerTools(ctx, config)
+  registerCommand(ctx, isForced, setForced, warn)
+  registerDurableTrim(ctx, config, warn, isForced)
+  registerAutoruns(ctx, config, warn, isForced)
+  registerDereference(ctx, config, warn)
+  registerPrompt(ctx, config, warn)
 }
 
 /** Human-readable form of an unknown thrown value. */
@@ -127,11 +138,12 @@ function describe(error) {
 
 /* ------------------------------------------------------------------- tools */
 
-function registerTools(ctx, config, isOn) {
+function registerTools(ctx, config) {
   ctx.tools.register({
     name: REWRITE_TOOL,
     description: [
       'Replace older history in your context with a memory you write.',
+      'Available in every session: this never needs a user command.',
       `Everything older than the last keep_recent_messages messages becomes one numbered node, "${MEMORY_PREFIX}<n>-<memory>",`,
       'and the tool call that asked for it is forgotten along with the rest.',
       'Write whatever is worth keeping - decisions, file paths, open threads - as tersely as you can.',
@@ -160,9 +172,6 @@ function registerTools(ctx, config, isOn) {
     },
     async execute(args, exec) {
       const session = exec?.agent?.session
-      if (!isOn(session)) {
-        throw new Error(`${REWRITE_TOOL}: rewritten memory is off for this session; the user enables it with /${COMMAND} enable`)
-      }
       const memory = typeof args?.memory === 'string' ? args.memory : ''
       if (memory.length === 0) throw new Error(`${REWRITE_TOOL}: "memory" must be a non-empty string`)
       const requested = args?.keep_recent_messages
@@ -271,28 +280,39 @@ function access(session, citations, reason, maxChars) {
 
 /* ----------------------------------------------------------------- command */
 
-function registerCommand(ctx, isOn, setOn, warn) {
+function registerCommand(ctx, isForced, setForced, warn) {
   ctx.inject(['commands'], (scope) => {
     try {
       scope.commands.register({
         name: COMMAND,
-        description: 'Turn rewritten memory on or off, report this build, or update the plugin',
+        description: 'Force rewritten memory on or off for the session, report this build, or update the plugin',
         input: { hint: 'enable | disable | status | version | updateplugin' },
         async handler(invocation) {
           const session = invocation.agent?.session
           const verb = invocation.rawInput.trim().toLowerCase()
           if (verb === 'enable') {
-            setOn(session, true)
-            return { kind: 'success', text: 'Rewritten memory enabled for this session.' }
+            setForced(session, true)
+            return {
+              kind: 'success',
+              text: 'Rewritten memory forced on for this session: the automatic passes run at every tool call '
+                + 'and every message end. The agent could always rewrite on its own, and still can.',
+            }
           }
           if (verb === 'disable') {
-            setOn(session, false)
-            return { kind: 'success', text: 'Rewritten memory disabled for this session.' }
+            setForced(session, false)
+            return {
+              kind: 'success',
+              text: 'Rewritten memory forced mode off for this session: the automatic passes stop, and the agent '
+                + 'can still rewrite, cite, and dereference on demand.',
+            }
           }
           if (verb === '' || verb === 'status') {
             return {
               kind: 'success',
-              text: `Rewritten memory is ${isOn(session) ? 'enabled' : 'disabled'} for this session.`,
+              text: isForced(session)
+                ? 'Rewritten memory is forced on for this session: automatic passes at every tool call and message end.'
+                : 'Rewritten memory is agent-initiated only for this session: no automatic passes, and rewrite_memory '
+                  + 'is available to the agent at any time.',
             }
           }
           if (verb === 'version') return { kind: 'success', text: versionText(ctx) }
@@ -405,16 +425,22 @@ async function updatePlugin(ctx) {
 
 /* -------------------------------------------------------- durable trimming */
 
-function registerDurableTrim(ctx, config, warn, isOn) {
+function registerDurableTrim(ctx, config, warn, isForced) {
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const session = agent?.session
-    if (session !== undefined && isOn(session) && signal?.aborted !== true) {
+    if (session !== undefined && signal?.aborted !== true) {
+      /*
+       * An agent-initiated rewrite lands whether or not forced mode is on: the
+       * logged tool call is the request, and this is where the surface is
+       * quiescent. With no pending call this is a no-op.
+       */
       try {
         applyMemoryRewrite(ctx, config, session, warn)
       } catch (error) {
         warn(`memory rewrite failed: ${describe(error)}; continuing the turn`)
       }
-      if (config.autoStubToolResults) {
+      /* Automatic trimming is forced-only: it retires output nobody asked about. */
+      if (isForced(session) && config.autoStubToolResults) {
         try {
           stubRetiredToolResults(ctx, config, session, warn)
         } catch (error) {
@@ -438,10 +464,14 @@ function registerDurableTrim(ctx, config, warn, isOn) {
  * replacement copy of the original event. The memory itself is already a
  * `rwm-c-` node, so its own `session/event` pass is skipped — this makes the
  * autoruns idempotent without a separate pending state.
+ *
+ * Autoruns are forced-only: they are the automatic message-end pass, so they run
+ * when the session was enabled with `/rwm enable` and stay out of the way
+ * otherwise. The agent's own rewrite, access, and dereference are never gated.
  */
-function registerAutoruns(ctx, config, warn, isOn) {
+function registerAutoruns(ctx, config, warn, isForced) {
   ctx.on('session/event', (session, event) => {
-    if (!isOn(session)) return
+    if (!isForced(session)) return
     const text = eventText(event)
     if (text.length === 0) return
     if (parseConsoleMemory(text) !== null) return
@@ -596,11 +626,13 @@ function shadowPrice(ctx, session, shadowedSeqs) {
  * The agent's reasoning for the request is the reply text itself, so the same
  * lock applies here as in `rwm_access`: a memory that contradicts what the
  * agent says it is looking for is refused, and the refusal is a one-off note.
+ *
+ * Never gated: a memory the agent can cite is a memory it can pull back, whether
+ * or not the session was enabled.
  */
-function registerDereference(ctx, config, warn, isOn) {
+function registerDereference(ctx, config, warn) {
   ctx.on('session/event', (session, event) => {
     if (event?.type !== 'assistant/message') return
-    if (!isOn(session)) return
     const reply = replyText(event)
     const wanted = new Set()
     for (const match of reply.matchAll(DEREFERENCE)) wanted.add(Number(match[1]))
@@ -663,7 +695,7 @@ function appendNote(session, text) {
 
 /* ----------------------------------------------------------------- prompt */
 
-function registerPrompt(ctx, config, warn, isOn) {
+function registerPrompt(ctx, config, warn) {
   ctx.inject(['systemPrompt'], (scope) => {
     const service = scope.systemPrompt
     if (service === undefined) return
@@ -687,7 +719,7 @@ function registerPrompt(ctx, config, warn, isOn) {
         service.context({
           name: 'autotrim:index',
           order: config.sectionOrder + 10,
-          text: context => indexText(config, isOn, context?.agent?.session),
+          text: context => indexText(config, context?.agent?.session),
         })
       }
     } catch (error) {
@@ -697,8 +729,8 @@ function registerPrompt(ctx, config, warn, isOn) {
 }
 
 /** The numbered list of everything the model can no longer see. */
-function indexText(config, isOn, session) {
-  if (session === undefined || !isOn(session)) return ''
+function indexText(config, session) {
+  if (session === undefined) return ''
   try {
     const index = buildIndex(session.snapshotEvents())
     const visible = new Set()

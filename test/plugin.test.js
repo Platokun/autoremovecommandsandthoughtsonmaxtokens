@@ -341,6 +341,17 @@ describe('rewrite_memory tool', () => {
       /at least 1/,
     )
   })
+
+  it('is available with no command at all', async () => {
+    const session = makeSession()
+    const { ctx, tools } = fakeHarness({ session })
+    apply(ctx, {})
+    const value = await tools.get('rewrite_memory').execute(
+      { memory: 'note', keep_recent_messages: 2 },
+      { agent: { session } },
+    )
+    assert.equal(value.applied, true, 'an un-configured session is not a refusal')
+  })
 })
 
 describe('durable memory rewrite', () => {
@@ -442,6 +453,18 @@ describe('durable tool-output trimming', () => {
     await runPreStep(listeners, session)
     assert.equal(session.appended.length, 0)
   })
+
+  it('auto-trims only while the session is forced', async () => {
+    const session = makeSession()
+    const { ctx, listeners, commands } = fakeHarness({ session })
+    apply(ctx, { retainRecentMessages: 2 })
+    await runPreStep(listeners, session)
+    assert.equal(session.appended.length, 0, 'no automatic trim without forced mode')
+
+    await commands.get(COMMAND).handler({ agent: { session }, rawInput: 'enable' })
+    await runPreStep(listeners, session)
+    assert.equal(session.appended.length, 2, 'forced mode retires the old tool output')
+  })
 })
 
 describe('autoruns', () => {
@@ -530,6 +553,29 @@ describe('autoruns', () => {
   })
 })
 
+describe('dereference', () => {
+  it('pulls a memory back with $rwm-<n>-full even when the session was never forced', async () => {
+    const session = makeSession({ seeds: [rewriteCall('short note', 2)] })
+    const { ctx, listeners } = fakeHarness({ session })
+    apply(ctx, {})
+    await runPreStep(listeners, session)
+    assert.equal(session.appended.length, 2, 'the agent-made memory exists')
+
+    appendAndEvent(
+      listeners,
+      session,
+      'assistant/message',
+      { message: assistantText('a9', 'I want the short note back as $rwm-1-full.') },
+      { surfaceOp: 'append' },
+    )
+
+    const note = session.appended.at(-1)
+    assert.equal(note.type, 'user/message')
+    assert.match(note.data.content[0].text, /^\[rwm-1-full\]/)
+    assert.match(note.data.content[0].text, /Reasoning lock/)
+  })
+})
+
 describe('context_recall tool', () => {
   it('grants a citation whose reasoning the content supports', async () => {
     const session = makeSession()
@@ -570,20 +616,30 @@ describe('context_recall tool', () => {
     assert.match(bad.text, /not a citation/)
   })
 
-  it('turns the feature off by default and back on with the command', async () => {
+  it('lets the agent rewrite with no command, and forces the automatic passes with one', async () => {
     const session = makeSession({ seeds: [rewriteCall('short note', 2)] })
     const { ctx, listeners, commands } = fakeHarness({ session })
     apply(ctx, {})
     const command = commands.get(COMMAND)
     assert.ok(command, 'the /rwm command is registered')
-    assert.match((await command.handler({ agent: { session }, rawInput: 'status' })).text, /disabled/)
+    assert.match(
+      (await command.handler({ agent: { session }, rawInput: 'status' })).text,
+      /agent-initiated only/,
+      'an un-configured session is agent-initiated only, not gated',
+    )
+
+    /*
+     * The agent is never gated: its own pending rewrite lands at the next
+     * pre-step with forced mode off and no command ever run.
+     */
     await runPreStep(listeners, session)
-    assert.equal(session.appended.length, 0, 'a disabled session is left alone')
+    assert.equal(session.appended.length, 2, 'an agent-initiated rewrite folds with nothing enabled')
 
     assert.equal((await command.handler({ agent: { session }, rawInput: 'enable' })).kind, 'success')
-    assert.match((await command.handler({ agent: { session }, rawInput: 'status' })).text, /enabled/)
-    await runPreStep(listeners, session)
-    assert.equal(session.appended.length, 2, 'an enabled session folds')
+    assert.match(
+      (await command.handler({ agent: { session }, rawInput: 'status' })).text,
+      /forced on/,
+    )
 
     assert.equal((await command.handler({ agent: { session }, rawInput: 'disable' })).kind, 'success')
     const unknown = await command.handler({ agent: { session }, rawInput: 'nonsense' })

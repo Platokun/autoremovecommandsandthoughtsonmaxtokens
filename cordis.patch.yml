@@ -14,7 +14,8 @@
     - id: dsh-autotrim-context
       name: '@local/dsh-autotrim-context'
       config:
-        # Off until the user runs /rwm enable in the session.
+        # Force the automatic passes on without /rwm enable. The agent's own
+        # rewrite_memory/rwm_access/$rwm-<n>-full calls never need this.
         enabledByDefault: false
         # Messages at the tail of the conversation that are never rewritten.
         retainRecentMessages: 8
